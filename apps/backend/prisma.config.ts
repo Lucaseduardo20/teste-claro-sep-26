@@ -18,7 +18,7 @@ export default defineConfig({
   migrations: {
     path: "prisma/migrations",
     // O seed roda em TypeScript para consumir `@repo/contracts` com tipos.
-    seed: "tsx prisma/seed.ts",
+    seed: "pnpm exec tsx prisma/seed.ts",
   },
   datasource: {
     url: DATABASE_URL,
