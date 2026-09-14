@@ -5,7 +5,10 @@ packages:
 # pnpm 10+ não roda scripts de instalação por padrão. Estas dependências precisam
 # do postinstall para funcionar, pois incluem binários nativos e git hooks.
 allowBuilds:
+  "@prisma/engines": true
+  esbuild: true
   lefthook: true
+  prisma: true
   sharp: true
   unrs-resolver: true
 
