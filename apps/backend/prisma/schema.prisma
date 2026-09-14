@@ -1,0 +1,229 @@
+// Schema do domínio "Cancelamento com Retenção Inteligente".
+//
+// Tradução fiel de `packages/contracts/src/types.ts` para o Postgres. O contracts é
+// especificação congelada: quando este arquivo e a spec divergirem, é este arquivo que
+// está errado. As decisões de modelagem estão em DECISIONS.md, na raiz do repositório.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// A URL de conexão não mora mais aqui: o Prisma 7 a lê de `prisma.config.ts`
+// (migrate/introspect) e do driver adapter passado ao `PrismaClient` (runtime).
+// Nos dois caminhos a origem é a mesma: `DATABASE_URL` do apps/backend/.env.
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums — espelham 1:1 os enums de `types.ts`, como tipos nativos do Postgres.
+// ---------------------------------------------------------------------------
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+
+  @@map("billing_cycle")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  PAUSED
+
+  @@map("subscription_status")
+}
+
+enum EngagementType {
+  LOGIN
+  PLAYBACK
+  DOWNLOAD
+  INTERACTION
+
+  @@map("engagement_type")
+}
+
+enum PaymentStatus {
+  ON_TIME
+  LATE
+  FAILED
+
+  @@map("payment_status")
+}
+
+enum ReasonCategory {
+  PRICE
+  LACK_OF_USE
+  TECHNICAL_ISSUE
+  COMPETITION
+  OTHER
+
+  @@map("reason_category")
+}
+
+enum RiskBand {
+  LOW
+  GREY
+  HIGH
+
+  @@map("risk_band")
+}
+
+enum OfferType {
+  DISCOUNT
+  UPGRADE
+  PAUSE
+
+  @@map("offer_type")
+}
+
+enum OfferStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+
+  @@map("offer_status")
+}
+
+enum OutcomeType {
+  CANCELLED
+  AUTOMATIC_OFFER
+  HUMAN_RETENTION
+
+  @@map("outcome_type")
+}
+
+// ---------------------------------------------------------------------------
+// Cadastro
+// ---------------------------------------------------------------------------
+
+/// Plano: tipo contratado, com benefícios, valor recorrente e ciclo de cobrança.
+model Plan {
+  id         String       @id @db.Uuid
+  name       String
+  priceCents Int          @map("price_cents")
+  cycle      BillingCycle
+  benefits   String[]
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+/// Assinante: pessoa titular de uma assinatura recorrente.
+model Subscriber {
+  id        String   @id @db.Uuid
+  name      String
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subscriptions Subscription[]
+
+  @@map("subscribers")
+}
+
+/// Assinatura: contrato recorrente entre assinante e provedor. Centro do grafo —
+/// é a partir dela que se monta o `ScoringInput` inteiro.
+model Subscription {
+  id           String             @id @db.Uuid
+  subscriberId String             @map("subscriber_id") @db.Uuid
+  planId       String             @map("plan_id") @db.Uuid
+  startedAt    DateTime           @map("started_at") @db.Timestamptz(3)
+  status       SubscriptionStatus
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime           @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  subscriber Subscriber @relation(fields: [subscriberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  plan       Plan       @relation(fields: [planId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  engagementEvents EngagementEvent[]
+  paymentEvents    PaymentEvent[]
+  cancellations    Cancellation[]
+
+  @@index([subscriberId])
+  @@index([planId])
+  @@map("subscriptions")
+}
+
+// ---------------------------------------------------------------------------
+// Eventos (append-only, entradas do Agente de Scoring)
+// ---------------------------------------------------------------------------
+
+/// Evento de Engajamento: interação registrada do assinante com o serviço.
+model EngagementEvent {
+  id             String         @id @db.Uuid
+  subscriptionId String         @map("subscription_id") @db.Uuid
+  type           EngagementType
+  occurredAt     DateTime       @map("occurred_at") @db.Timestamptz(3)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([subscriptionId, occurredAt])
+  @@map("engagement_events")
+}
+
+/// Evento de Pagamento: registro de cobrança recorrente.
+model PaymentEvent {
+  id             String        @id @db.Uuid
+  subscriptionId String        @map("subscription_id") @db.Uuid
+  amountCents    Int           @map("amount_cents")
+  status         PaymentStatus
+  date           DateTime      @db.Timestamptz(3)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([subscriptionId, date])
+  @@map("payment_events")
+}
+
+// ---------------------------------------------------------------------------
+// Fluxo de cancelamento
+// ---------------------------------------------------------------------------
+
+/// Cancelamento: solicitação de encerramento iniciada pelo assinante.
+///
+/// `reasonCategory`, `risk`, `band` e os dois campos do outcome (`outcomeType`,
+/// `humanReason`) são nullable e **sem default**: um cancelamento nasce antes de ser
+/// decidido, e NULL é o único valor que significa "ainda não determinado".
+model Cancellation {
+  id             String  @id @db.Uuid
+  subscriptionId String  @map("subscription_id") @db.Uuid
+  rawReason      String  @map("raw_reason")
+
+  reasonCategory ReasonCategory? @map("reason_category")
+  risk           Decimal?        @db.Decimal(3, 2)
+  band           RiskBand?
+
+  // CancellationOutcome achatado: o `offer` do outcome mora na tabela `offers`.
+  outcomeType OutcomeType? @map("outcome_type")
+  humanReason String?      @map("human_reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  offer        Offer?
+
+  @@index([subscriptionId])
+  @@index([outcomeType, band])
+  @@map("cancellations")
+}
+
+/// Oferta de Retenção: existe no máximo uma por cancelamento, e só no caminho
+/// `AUTOMATIC_OFFER`. O `@unique` em `cancellationId` é o que torna a relação 1:0..1.
+model Offer {
+  id             String      @id @db.Uuid
+  cancellationId String      @unique @map("cancellation_id") @db.Uuid
+  type           OfferType
+  amountCents    Int?        @map("amount_cents")
+  status         OfferStatus
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime    @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  cancellation Cancellation @relation(fields: [cancellationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("offers")
+}
