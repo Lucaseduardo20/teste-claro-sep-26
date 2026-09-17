@@ -892,3 +892,252 @@ Nesta tarefa vale registrar dois pontos específicos:
 - **Os testes foram verificados por mutação.** Não aceitei "41 testes passando" como prova:
   quebrei a regra de quatro formas diferentes (as da tabela da seção 11) e confirmei que os
   testes certos falham em cada caso. Essa é a diferença entre ter cobertura e ter garantia.
+
+---
+
+## Tarefa 03 — Agente de Scoring e timeout
+
+O Agente de Scoring é o componente que atribui o risco de churn a um cancelamento em
+andamento. No núcleo deste teste ele é um **mock determinístico** — não há LLM nenhum. Mas a
+forma como ele é montado é a parte que interessa: o agente é um _port_, o mock é um _adapter_,
+e o **deadline mora fora dos dois**.
+
+Quatro arquivos em `apps/backend/src/scoring/`:
+
+| Arquivo                 | Papel                                                                   |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `mock-scoring-agent.ts` | Adapter determinístico. Só produz risco e demora. Não conhece deadline. |
+| `with-deadline.ts`      | A corrida contra o relógio. Genérica, sem framework.                    |
+| `scoring.service.ts`    | Orquestra: injeta o agente, aplica o prazo, traduz a saída.             |
+| `scoring.module.ts`     | Liga o port ao adapter pelo token `SCORING_AGENT`.                      |
+
+### 16. Por que o timeout é do wrapper e não do mock
+
+O enunciado é explícito ao proibir `timedOut: true` devolvido na hora, e vale entender por que
+isso não é frescura de teste.
+
+**Um agente não sabe que está atrasado.** Um adapter de LLM faz uma chamada HTTP e espera. Ele
+não tem opinião sobre orçamento de tempo — quem tem é o caso de uso. A mesma chamada que é
+"rápida demais para se preocupar" num job noturno é "inaceitável" num fluxo de auto-atendimento
+em que o assinante está olhando para uma tela.
+
+Colocar o deadline dentro do agente teria três consequências ruins:
+
+1. **Cada adapter futuro reimplementaria a política.** Um `OpenAIScoringAgent` teria que
+   lembrar de aplicar o mesmo prazo, com o mesmo fallback. Alguém esqueceria.
+2. **Não daria para testar o mecanismo.** Se o mock decide sozinho que estourou, o teste do
+   timeout está testando um `if` que lê uma flag, não a corrida contra o relógio.
+3. **Seria a abstração errada.** "Quanto tempo eu topo esperar" é uma decisão de produto, do
+   mesmo tipo que os limiares de risco da Tarefa 02. Ela pertence à camada que orquestra.
+
+Por isso a divisão é literal no código: o mock **só demora** (`setTimeout` de
+`SCORING_TIMEOUT_MS + 500ms` no cenário de timeout), e quem decide "demorou demais" é o
+`ScoringService`.
+
+**Ports & Adapters, concretamente.** `ScoringAgent` é uma interface da spec — o _port_.
+`MockScoringAgent` é um _adapter_; um `OpenAIScoringAgent` seria outro. Ninguém depende de uma
+implementação: o `ScoringService` depende do token, e o token é resolvido no
+`scoring.module.ts`. Trocar o mock por um LLM é **uma linha, num arquivo**:
+
+```ts
+{ provide: SCORING_AGENT, useClass: OpenAIScoringAgent }
+```
+
+Nada mais muda — nem o service, nem o deadline, nem a regra de decisão da Tarefa 02, nem
+nenhum teste que não seja do próprio adapter. E repare que o deadline aplicado por fora fica
+_mais_ importante com um LLM real do que com o mock, não menos.
+
+### 17. Como o `Promise.race` funciona, e por que isso é o caminho real
+
+```ts
+return await Promise.race([
+  operation.then((value) => ({ timedOut: false, value })),
+  deadline, // resolve { timedOut: true } depois de deadlineMs
+]);
+```
+
+O ponto que costuma ser mal entendido: **`Promise.race` não cancela ninguém.** JavaScript não
+tem como cancelar uma promessa já criada — a chamada de rede já saiu, o `setTimeout` já está
+agendado. O que a corrida faz é decidir **de quem a gente vai ouvir a resposta**. O perdedor
+continua rodando em segundo plano até terminar sozinho, e o resultado dele é descartado.
+
+Isso não é limitação: é exatamente a semântica que um deadline de atendimento quer. "Passou do
+tempo, eu sigo sem você" — e se a resposta chegar depois, paciência, a decisão já foi tomada.
+
+**Por que isso exerce o caminho real.** No `scenario-timeout`, o mock agenda um `setTimeout` de
+3500ms e realmente espera. O relógio do wrapper dispara aos 3000ms. A corrida acontece de
+verdade, com dois timers reais competindo. Não há flag sendo lida em lugar nenhum.
+
+Conferi por mutação que o teste prova isso, e não outra coisa:
+
+| Mutação                                                          | Testes que quebraram |
+| ---------------------------------------------------------------- | -------------------- |
+| deadline afrouxado (`SCORING_TIMEOUT_MS * 10`)                   | 2                    |
+| mock respondendo na hora em vez de esperar (o que a spec proíbe) | 3                    |
+
+A primeira prova que é o **race** que produz o timeout; a segunda, que é o **mock esperando de
+verdade** que faz o race valer. Se qualquer um dos dois fosse fingido, os testes ficariam
+verdes indevidamente — e não ficam.
+
+O teste do timeout leva **~3 segundos de relógio de parede, de propósito**. Com relógio falso
+ele passaria em milissegundos e provaria bem menos. Os outros testes da suíte usam
+`vi.useFakeTimers()`, porque neles a latência é acidental; só o teste do deadline paga o preço
+real, e o comentário no arquivo diz isso para ninguém "otimizar" depois.
+
+### 18. O timer que precisa ser limpo — e o que eu achei que precisava e não precisava
+
+**O vazamento real: o timer do deadline.** Se a operação responde primeiro e ninguém chama
+`clearTimeout`, o `setTimeout` continua agendado até o fim do prazo. Em produção isso é memória
+retida a cada chamada. Em teste é pior: o Node mantém o event loop vivo enquanto houver timer
+pendente, então a suíte **trava** esperando um relógio que não interessa mais — 3 segundos por
+chamada bem-sucedida, num fluxo que deveria terminar em 300ms.
+
+O `finally` limpa nos três desfechos: operação ganhou, deadline ganhou, operação falhou.
+
+```ts
+try {
+  return await Promise.race([...]);
+} finally {
+  clearTimeout(timer);
+}
+```
+
+O teste mede isso diretamente com `vi.getTimerCount()`, e não por sintoma.
+
+**O vazamento que eu achei que existia e não existe.** O reflexo seguinte é proteger contra a
+_rejeição tardia_: se o deadline vence e a operação rejeita depois, aquela promessa perdedora
+viraria `unhandledRejection` — que no Node moderno derruba o processo. Escrevi um
+`operation.catch(() => {})` para isso.
+
+Depois testei **sem** ele: o teste continua passando. O motivo é que `Promise.race` anexa um
+handler a _todas_ as promessas que recebe, e esse handler continua lá depois de a corrida estar
+decidida. A rejeição tardia já é observada. O `.catch()` extra era código morto se passando por
+proteção, então saiu — e o teste que o justificaria ficou, agora documentando o comportamento
+real do `Promise.race` em vez de uma defesa imaginária.
+
+Registro isso porque é o tipo de linha que sobrevive anos num código com um comentário
+convincente e errado.
+
+**Um detalhe que os testes também pegaram:** nos testes de rejeição, a asserção
+`expect(promise).rejects` precisa ser montada **antes** de adiantar o relógio falso. Montar
+depois deixa a promessa rejeitada sem ouvinte por um tick, e o Node dispara
+`PromiseRejectionHandledWarning`. Os testes ficaram com um comentário explicando, porque é uma
+armadilha de teste assíncrono que se repete.
+
+### 19. Por que `latencyMs` é a latência simulada, não o tempo de parede
+
+`ScoringResult.latencyMs` reporta a latência que o agente **simula**, não um cronômetro.
+
+O motivo fica óbvio quando se pergunta para que serve o número. Ele é um dado de domínio:
+"quanto o Agente de Scoring levou para responder" — a métrica que diria se vale trocar o modelo,
+se o p95 está perto do orçamento, se o timeout está bem calibrado. Medido com relógio de parede
+num mock, ele viraria uma medição do event loop do Node, que não significa nada.
+
+Pior: no cenário de timeout, um cronômetro reportaria ~3000ms de parede — o tempo que _o
+wrapper_ esperou — e alguém leria isso como "o agente respondeu em 3s", quando o agente não
+respondeu coisa nenhuma.
+
+Por isso a separação é explícita:
+
+- **Caminho normal:** `latencyMs` vem do agente, determinístico por hash do `subscriptionId`,
+  dentro de 200–1500ms. A mesma assinatura "demora" sempre o mesmo tanto, o que permite ao teste
+  afirmar o valor exato em vez de checar um intervalo.
+- **Caminho de timeout:** o service devolve `latencyMs: SCORING_TIMEOUT_MS` — o **orçamento
+  gasto**, não uma medição. Esperamos o prazo inteiro e desistimos; quanto o agente ainda
+  levaria é justamente o que não se sabe.
+
+O teste que prova isso usa um agente fake que responde **instantaneamente** declarando
+`latencyMs: 1234`. Se o service medisse o tempo de parede, viria ~0.
+
+### 20. Por que, no timeout, o risco fica indefinido — e uma tensão na spec
+
+No timeout o resultado **não tem risco**. Não é zero, não é o neutro: não existe.
+
+Isso conecta direto com a união discriminada da Tarefa 02 (seção 13). Se o timeout produzisse
+`risk: 0`, a regra classificaria como `LOW` e o cancelamento seguiria direto para `CANCELLED` —
+o **oposto** do que a spec manda (`scenario-timeout` tem que ir para retenção humana). Um valor
+default aqui não é conveniência, é um bug de negócio.
+
+**A tensão na spec.** O `ScoringResult` do contracts declara `risk: number` — obrigatório.
+Ou seja, **o tipo da spec não consegue representar o estado "estourou o prazo e não há risco"**,
+apesar de o mesmo tipo ter um campo `timedOut: boolean` que descreve exatamente esse estado. As
+duas coisas não fecham.
+
+Não toquei no contracts (é congelado, e alterá-lo reprova). Resolvi introduzindo um tipo meu na
+saída do service:
+
+```ts
+export type ScoringOutcome =
+  | {
+      timedOut: false;
+      risk: number;
+      rationale?: string | undefined;
+      latencyMs: number;
+    }
+  | { timedOut: true; latencyMs: number };
+```
+
+O agente continua honrando o contrato da spec (`ScoringResult`); o **service** devolve
+`ScoringOutcome`. E não é coincidência que essa união tenha a mesma forma da `DecisionInput` da
+Tarefa 02 — o encaixe entre as duas camadas fica direto:
+
+```ts
+const outcome = await scoring.score(input);
+
+const decision = decide(
+  outcome.timedOut
+    ? { timedOut: true }
+    : { timedOut: false, risk: outcome.risk, isHighValue },
+);
+```
+
+Sem adaptação forçada, sem `if` traduzindo formato. (A orquestração em si é da Tarefa 04 — aqui
+só deixei o encaixe pronto.)
+
+Consequência prática no mock: como `ScoringResult.risk` é obrigatório, o `MockScoringAgent`
+precisa devolver _algum_ número mesmo no cenário de timeout. Ele devolve o risco neutro — um
+valor **inalcançável na prática**, porque o deadline corta a corrida antes. Está comentado no
+código para ninguém achar que é significativo.
+
+### 21. Decisões menores, registradas
+
+**Risco para assinatura desconhecida.** Uma assinatura que não é nenhum dos 7 cenários recebe
+`(LOW_RISK_THRESHOLD + HIGH_RISK_THRESHOLD) / 2` — o **meio exato da zona cinzenta**, derivado
+dos dois limiares, nunca escrito como `0.5`. A escolha é conservadora e coerente com o fallback
+de timeout: sem informação para decidir, um humano decide. Nunca cancela sozinho nem dá desconto
+sozinho.
+
+**Margem do cenário de timeout.** O mock espera `SCORING_TIMEOUT_MS + 500ms`, derivado da
+constante. Se a spec afrouxar o deadline, o cenário continua estourando. A margem existe para o
+teste não depender de o agendador do Node acordar no milissegundo exato.
+
+**`useFactory` em vez de `useClass` no módulo.** É o que mantém o `MockScoringAgent` sem
+`@Injectable()` e sem nenhum import do Nest. O adapter não precisa saber que existe um container
+de DI para ser um adapter — e isso deixa ele instanciável direto em teste (`new
+MockScoringAgent()`), sem subir módulo.
+
+**Token em arquivo próprio (`scoring.tokens.ts`).** O módulo importa o service, e o service
+precisa do token; com o token dentro do módulo, os dois arquivos se importariam mutuamente. E o
+token é um `Symbol` porque `ScoringAgent` é uma **interface**, que some em runtime — não dá para
+usar a própria classe como token sem amarrar o consumidor a uma implementação.
+
+**`ScoringModule` registrado no `AppModule`.** Nada consome o service ainda (o POST é da Tarefa
+04), mas registrar agora faz o e2e do `/health` subir o grafo de DI inteiro — se o módulo
+estivesse mal montado, o teste que já existia acusaria.
+
+### 22. Uso de IA (Tarefa 03)
+
+Feita com assistência de IA (Claude Code), revisada por mim, nos mesmos termos das tarefas
+anteriores.
+
+O registro específico desta tarefa é sobre **o que a verificação empírica mudou no código**:
+
+- O `operation.catch()` do `withDeadline` foi escrito, testado, **provado desnecessário** e
+  removido (seção 18). Sem rodar o teste sem a linha, ela teria ficado ali para sempre com um
+  comentário convincente e falso.
+- O teste de timeout foi validado por mutação nos dois sentidos — afrouxando o deadline e
+  fazendo o mock responder na hora — para confirmar que ele prova o mecanismo, e não a leitura
+  de uma flag.
+- A tensão em `ScoringResult.risk` (seção 20) foi identificada lendo o contracts, não presumida:
+  é o tipo da spec que não expressa o estado que a própria spec descreve. Está registrada aqui,
+  como o TESTE.md pede, em vez de contornada em silêncio.

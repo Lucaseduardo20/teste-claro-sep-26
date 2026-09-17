@@ -103,6 +103,23 @@ O objetivo do scaffold é remover o atrito de infraestrutura (monorepo configura
 
 Detalhes de cada pacote: [`packages/contracts/README.md`](./packages/contracts/README.md), [`apps/backend/README.md`](./apps/backend/README.md) e [`apps/frontend/README.md`](./apps/frontend/README.md).
 
+## Observação sobre a spec
+
+`packages/contracts/` é especificação congelada e não foi alterada. Uma ambiguidade encontrada
+ao implementar o Agente de Scoring, registrada aqui conforme pede o
+[`TESTE.md`](./TESTE.md):
+
+**`ScoringResult.risk` é obrigatório (`risk: number`), mas o mesmo tipo declara
+`timedOut: boolean`.** Quando o agente estoura o `SCORING_TIMEOUT_MS` não existe risco para
+reportar — e a spec é clara em outro ponto ao dizer que, no timeout, o risco fica indefinido
+("não invente um número"). O tipo, portanto, não consegue representar o estado que a própria
+spec descreve.
+
+Não alterei o contracts. O adapter continua honrando `ScoringResult`, e o `ScoringService`
+devolve um tipo próprio (`ScoringOutcome`), uma união discriminada em que o ramo de timeout
+simplesmente não tem onde guardar um risco. O raciocínio completo está na seção 20 do
+[`DECISIONS.md`](./DECISIONS.md).
+
 ## Uso de IA
 
 Você pode usar IA para fazer o teste. Revise o resultado, entenda as decisões e esteja pronto para explicar o código na conversa final. Registre no README como usou a ferramenta ou diga que não usou. Nenhuma das duas escolhas reduz a nota; o que reprova está na seção **Uso de IA** de [`TESTE.md`](./TESTE.md#uso-de-ia).
