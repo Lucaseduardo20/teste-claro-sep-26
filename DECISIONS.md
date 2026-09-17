@@ -491,6 +491,8 @@ cenários diferentes usam o Premium. É o esperado.
 | `pnpm db:migrate`          | `prisma migrate dev` — cria e aplica migration a partir do schema       |
 | `pnpm db:migrate:deploy`   | `prisma migrate deploy` — aplica migrations existentes (CI/produção)    |
 | `pnpm db:seed`             | `prisma db seed` — carrega os 7 cenários (idempotente)                  |
+| `pnpm db:status`           | `prisma migrate status` — diz se o banco está em dia com as migrations  |
+| `pnpm db:studio`           | `prisma studio` — GUI para navegar nos dados                            |
 | `pnpm db:reset`            | `prisma migrate reset` — **apaga o banco**, reaplica tudo e roda o seed |
 
 O comando de seed está registrado em `apps/backend/prisma.config.ts`
@@ -505,7 +507,122 @@ docker exec -it smart-retention-db psql -U postgres -d smart_retention \
   -c "select count(*) from subscriptions;"
 ```
 
-### 6. Uso de IA
+### 6. Comandos úteis (referência)
+
+Tudo roda **a partir da raiz do repositório**. Sem exceção: `pnpm --filter <pacote> <script>`
+funciona de qualquer diretório e é o que evita rodar o script errado no pacote errado.
+
+#### Banco (Docker)
+
+| Comando                     | O que faz                                               |
+| --------------------------- | ------------------------------------------------------- |
+| `pnpm db:up`                | sobe o Postgres em `localhost:5432` (docker compose)    |
+| `pnpm db:down`              | derruba os containers (o volume de dados **permanece**) |
+| `docker compose down -v`    | derruba **e apaga o volume** — banco zerado de verdade  |
+| `docker compose logs -f db` | acompanha o log do Postgres                             |
+| `docker compose ps`         | mostra o estado e o healthcheck do container            |
+
+#### Prisma (schema, migrations, seed)
+
+Todos com o prefixo `pnpm --filter @repo/backend`:
+
+| Comando                    | O que faz                                                                   |
+| -------------------------- | --------------------------------------------------------------------------- |
+| `db:generate`              | gera o Prisma Client a partir do schema (roda sozinho no `postinstall`)     |
+| `db:migrate`               | `prisma migrate dev` — detecta mudança no schema, cria e aplica a migration |
+| `db:migrate --name <nome>` | idem, nomeando a migration em vez de responder ao prompt                    |
+| `db:migrate:deploy`        | `prisma migrate deploy` — só aplica o que já existe; é o comando de CI/prod |
+| `db:status`                | diz se o banco está em dia com as migrations, e o que falta aplicar         |
+| `db:seed`                  | carrega os 7 cenários (idempotente — pode rodar quantas vezes quiser)       |
+| `db:reset`                 | **apaga o banco**, reaplica todas as migrations e roda o seed               |
+| `db:studio`                | abre o Prisma Studio (GUI) em `localhost:5555`                              |
+
+Dois comandos sem script, para quando precisar:
+
+```bash
+# valida o schema.prisma sem tocar no banco
+pnpm --filter @repo/backend exec prisma validate
+
+# formata o schema.prisma (alinha colunas, ordena atributos)
+pnpm --filter @repo/backend exec prisma format
+```
+
+**Qual usar quando:**
+
+- mexeu no `schema.prisma` → `db:migrate` (gera a migration nova)
+- acabou de clonar, ou quer o banco limpo com os 7 cenários → `db:reset`
+- só quer repopular sem perder o schema → `db:seed`
+- o Prisma reclamou de tipo que não existe depois de um `git pull` → `db:generate`
+- "será que minha migration aplicou?" → `db:status`
+
+#### Desenvolvimento
+
+| Comando                                  | O que faz                                    |
+| ---------------------------------------- | -------------------------------------------- |
+| `pnpm install`                           | instala o workspace (e gera o Prisma Client) |
+| `pnpm dev:backend`                       | API em `http://localhost:3000` (watch)       |
+| `pnpm dev:frontend`                      | UI em `http://localhost:3001`                |
+| `pnpm dev`                               | os dois ao mesmo tempo                       |
+| `pnpm --filter @repo/backend start:repl` | REPL do Nest, para chamar service na mão     |
+| `pnpm build`                             | build dos três pacotes, na ordem certa       |
+
+Instalar dependência — **sempre com filtro, a partir da raiz**:
+
+```bash
+pnpm --filter @repo/backend  add <pkg>        # dependência de runtime
+pnpm --filter @repo/backend  add -D <pkg>     # dependência de desenvolvimento
+pnpm --filter @repo/frontend add <pkg>
+```
+
+#### Qualidade
+
+| Comando                                  | O que faz                                        |
+| ---------------------------------------- | ------------------------------------------------ |
+| `pnpm verify`                            | **o portão**: lint + typecheck + test + test:e2e |
+| `pnpm lint` / `pnpm typecheck`           | só a etapa correspondente, nos três pacotes      |
+| `pnpm test`                              | testes unitários dos três pacotes                |
+| `pnpm --filter @repo/backend test:watch` | vitest em watch, só no backend                   |
+| `pnpm --filter @repo/backend test:cov`   | cobertura do backend                             |
+| `pnpm format`                            | prettier nos pacotes                             |
+| `pnpm format:root`                       | prettier nos `.md` da raiz (inclui este arquivo) |
+
+O turbo cacheia por conteúdo: repetir `pnpm verify` sem mudar nada termina em milissegundos
+(`>>> FULL TURBO`). Se desconfiar do cache, `pnpm clean` derruba tudo — mas ele **também apaga
+`node_modules`** e exige `pnpm install` depois.
+
+#### `psql` no banco populado
+
+```bash
+# sessão interativa
+docker exec -it smart-retention-db psql -U postgres -d smart_retention
+```
+
+Dentro do `psql`: `\dt` lista as tabelas, `\d cancellations` descreve uma tabela **com os
+índices**, `\di` lista todos os índices, `\q` sai.
+
+Consultas de conferência que uso direto:
+
+```bash
+# o que o seed carregou
+docker exec -it smart-retention-db psql -U postgres -d smart_retention -c "
+  select 'plans' t, count(*) from plans
+  union all select 'subscribers',       count(*) from subscribers
+  union all select 'subscriptions',     count(*) from subscriptions
+  union all select 'engagement_events', count(*) from engagement_events
+  union all select 'payment_events',    count(*) from payment_events
+  union all select 'cancellations',     count(*) from cancellations
+  union all select 'offers',            count(*) from offers;"
+
+# o corte de alto valor, derivado dos dados (nunca hardcoded)
+docker exec -it smart-retention-db psql -U postgres -d smart_retention -c "
+  select distinct price_cents from plans order by price_cents;"
+
+# prova de que o seed é idempotente: rode duas vezes, o hash não muda
+docker exec -it smart-retention-db psql -U postgres -d smart_retention -At -c "
+  select md5(string_agg(t::text, '|' order by t::text)) from (select * from subscriptions) t;"
+```
+
+### 7. Uso de IA
 
 Esta tarefa (modelagem, `schema.prisma`, migration e seed) foi feita **com assistência de IA**
 — Claude Code, em sessão interativa, com revisão minha a cada passo.

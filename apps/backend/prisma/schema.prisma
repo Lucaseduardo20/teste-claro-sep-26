@@ -189,9 +189,9 @@ model PaymentEvent {
 /// `humanReason`) são nullable e **sem default**: um cancelamento nasce antes de ser
 /// decidido, e NULL é o único valor que significa "ainda não determinado".
 model Cancellation {
-  id             String  @id @db.Uuid
-  subscriptionId String  @map("subscription_id") @db.Uuid
-  rawReason      String  @map("raw_reason")
+  id             String @id @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  rawReason      String @map("raw_reason")
 
   reasonCategory ReasonCategory? @map("reason_category")
   risk           Decimal?        @db.Decimal(3, 2)
