@@ -138,7 +138,7 @@ scenario-low")`. O resultado é o mesmo byte a byte em toda execução. É isso 
   continuar passando no `assertUUIDv7` do contracts e para manter a ordenação temporal que o
   v7 dá de graça (os 48 bits mais significativos são o timestamp em ms).
 
-A conciliação no schema está na seção 4.4: **`id` é `String @id @db.Uuid` sem `@default`** — o
+A conciliação no schema está na seção 3.6: **`id` é `String @id @db.Uuid` sem `@default`** — o
 banco nunca inventa id, quem escreve sempre informa. O seed informa o id fixo do contracts; o
 app, em runtime, informa um UUID v7 recém-gerado. Um único caminho de código, duas origens de
 valor.
@@ -643,3 +643,252 @@ Como foi o processo, para ficar registrado com precisão:
   e `pnpm verify` foi executado ao final.
 
 Assumo a responsabilidade pelo resultado e consigo defender cada decisão deste documento.
+
+---
+
+## Tarefa 02 — Regras de decisão (camada pura)
+
+Esta é a camada que decide, a partir do risco de churn, o que acontece com um cancelamento.
+Ela não sabe o que é HTTP, não sabe o que é Postgres e não sabe o que é NestJS.
+
+Dois arquivos, sem dependência de framework:
+
+| Arquivo                                       | Contém                                                          |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| `apps/backend/src/decision/risk-band.ts`      | Regra 1 — `toBand(risk)`: risco → faixa                         |
+| `apps/backend/src/decision/decision.rules.ts` | Regras 2 e 3 — `decideOutcome`, `decide`, os três `humanReason` |
+
+### 8. Por que a camada é pura e isolada
+
+"Pura" aqui significa literalmente: mesma entrada, mesma saída, sempre; nenhum efeito
+colateral; nenhuma leitura do mundo externo. Sem `fetch`, sem `prisma`, sem `Date.now()`, sem
+`process.env`, sem `@Injectable()`.
+
+Três razões, em ordem de importância para este teste:
+
+**1. É a parte que mais é testada, então precisa ser a mais fácil de testar.** Um teste de
+fronteira aqui é literalmente `expect(toBand(0.3)).toBe(RiskBand.GREY)` — sem subir módulo do
+Nest, sem mockar repositório, sem banco, sem `async`. Os 41 testes rodam em ~120 ms. Se a regra
+estivesse dentro de um service com `@Inject(PrismaService)`, cada caso de fronteira exigiria um
+`Test.createTestingModule` e um mock, e o custo de escrever o 15º caso de teste desencorajaria
+escrever o 15º caso de teste. A facilidade de testar não é conforto: é o que determina quantos
+casos vão existir de fato.
+
+**2. A regra de negócio fica legível como regra de negócio.** `decision.rules.ts` pode ser lido
+por alguém que não programa em TypeScript — é um `switch` sobre três faixas. Quando a área de
+negócio mudar a política ("agora alto valor também intercepta em GREY"), a mudança é uma linha,
+num arquivo, com um teste que falha se a mudança for parcial.
+
+**3. Separação de responsabilidade, com um caso concreto: `isHighValue`.** Ver seção 12.
+
+### 9. Por que separei `toBand` do mapa de outcome
+
+São **duas decisões de negócio independentes**, que mudam por motivos diferentes e em ritmos
+diferentes:
+
+- `toBand` responde _"quão arriscado é este cancelamento?"_ — é calibração de modelo. Mexer nos
+  limiares é uma decisão de data science.
+- `decideOutcome` responde _"o que a empresa faz com esse nível de risco?"_ — é política
+  comercial. Interceptar alto valor é uma decisão de operação/retenção.
+
+Se estivessem na mesma função, todo teste de política teria que passar por um risco numérico
+(`decide({ risk: 0.85, ... })`), e eu estaria testando duas regras ao mesmo tempo: um teste de
+interceptação de alto valor que falha não diria se o bug é na faixa ou no mapa. Separadas,
+`decideOutcome(RiskBand.HIGH, true)` testa a política **sem tocar em número nenhum** — repare
+que `decision.rules.spec.ts` inteiro, na parte da Regra 2, não tem um único risco.
+
+`decide(input)` existe por cima das duas, como a composição que o chamador vai usar de fato. É
+a única das três que conhece o timeout.
+
+### 10. Os três caminhos até a retenção humana
+
+Este é o ponto mais sutil da tarefa, e o que eu mais quero defender. **Três causas diferentes
+produzem o mesmo par `band = GREY` / `outcome = HUMAN_RETENTION`** — mas não são a mesma coisa,
+e achatar as três num motivo só destruiria informação:
+
+| Caminho                        | `humanReason`                       | O que realmente aconteceu                                                   |
+| ------------------------------ | ----------------------------------- | --------------------------------------------------------------------------- |
+| Risco entre os limiares        | `grey zone`                         | O modelo respondeu, e a resposta dele é "não sei o suficiente para decidir" |
+| `HIGH` + alto valor recorrente | `high recurring value at high risk` | O modelo respondeu com confiança; a **política** é que vetou o automático   |
+| Timeout do Agente de Scoring   | `scoring agent timeout`             | O modelo **não respondeu**. Não houve decisão nenhuma, houve uma falha      |
+
+Por que a distinção importa, concretamente:
+
+- **Para quem atende.** O especialista que abre a fila de retenção humana precisa de abordagens
+  diferentes. `grey zone` é um caso comum. `high recurring value at high risk` é um assinante
+  caro prestes a sair — tem urgência e provavelmente alçada maior de desconto. `scoring agent
+timeout` é um caso que nem foi avaliado: pode ser um cancelamento trivial que só caiu ali por
+  azar de infraestrutura.
+- **Para quem opera o sistema.** Um pico de `grey zone` diz que o modelo está mal calibrado. Um
+  pico de `scoring agent timeout` é **incidente de produção** e acorda alguém. Se as duas coisas
+  compartilhassem a mesma string, esse alerta seria impossível de escrever.
+- **Para a métrica de Custo Evitado.** A PoC existe para provar redução de casos que vão para o
+  humano. Casos que foram para o humano por falha técnica são custo que o sistema deveria ter
+  evitado e não evitou — contá-los junto com a zona cinzenta legítima mascararia exatamente o
+  número que o projeto quer mostrar.
+
+Por isso o fallback de timeout, em `decide()`, **não** reaproveita `decideOutcome(GREY, ...)`.
+Seria tentador (o resultado é o mesmo par), e estaria errado: o `humanReason` sairia como
+`grey zone`, afirmando uma indecisão do modelo que nunca existiu.
+
+Os três textos vivem numa constante `HUMAN_REASON` no módulo da regra, e não espalhados por
+`return`s. Assim é impossível haver dois lugares escrevendo "grey zone" com grafias diferentes,
+e o teste "os três motivos são distintos entre si" tem onde olhar.
+
+### 11. Por que os limites são exclusivos, e como os testes garantem isso
+
+A spec é explícita: `risk < 0.30` é `LOW`, `risk > 0.70` é `HIGH`, e **`0.30` e `0.70` exatos
+caem em `GREY`**. A faixa cinzenta é fechada dos dois lados; as pontas são abertas.
+
+A lógica de negócio por trás disso é conservadora, e é coerente: na dúvida, um humano decide. O
+limiar é uma linha arbitrária traçada sobre um número contínuo — um risco de exatamente `0.700`
+não é materialmente diferente de `0.699`. Empurrar o valor de fronteira para a ação automática
+significaria automatizar justamente o caso mais próximo da incerteza.
+
+**Como implementei.** Não como uma cadeia de três comparações, mas assim:
+
+```ts
+if (risk < LOW_RISK_THRESHOLD) return RiskBand.LOW;
+if (risk > HIGH_RISK_THRESHOLD) return RiskBand.HIGH;
+
+return RiskBand.GREY; // tudo que sobrou
+```
+
+`GREY` é o **resto**, não uma faixa testada. Isso não é economia de linha: é o que torna
+estruturalmente impossível existir um risco sem faixa (buraco) ou em duas faixas
+(sobreposição). O bug clássico dessa regra é escrever `<=` onde devia ser `<`; aqui, a única
+forma de errar é inverter um dos dois operadores — e é exatamente isso que os testes atacam.
+
+**Como os testes garantem.** Em três camadas:
+
+1. **Fronteiras exatas**, asseridas contra as constantes importadas, não contra literais:
+   `expect(toBand(LOW_RISK_THRESHOLD)).toBe(RiskBand.GREY)`. Se alguém mudar o limiar no
+   contracts, o teste continua testando a _regra_ (o limiar exato é cinzento), não um número.
+2. **Vizinhança**: `0.29` → LOW, `0.31` → GREY, `0.69` → GREY, `0.71` → HIGH. Fecham o cerco
+   dos dois lados de cada fronteira.
+3. **Varredura completa**: de `0.00` a `1.00` de centésimo em centésimo — que é exatamente a
+   escala que o banco guarda em `numeric(3,2)` (ver seção 3.5 da Tarefa 01) — conferindo que toda entrada
+   cai em uma e só uma faixa.
+
+Verifiquei que esses testes **mordem**, não só passam. Mutei a regra de propósito e rodei:
+
+| Mutação aplicada                                  | Testes que quebraram |
+| ------------------------------------------------- | -------------------- |
+| `<` → `<=` no limiar inferior                     | 3                    |
+| `>` → `>=` no limiar superior                     | 4                    |
+| interceptação de alto valor estendida para `GREY` | 4                    |
+| `humanReason` do timeout trocado por `grey zone`  | 4                    |
+
+Um teste que passa não prova nada sozinho; um teste que falha quando o código quebra, sim.
+
+### 12. Por que a regra recebe `isHighValue` pronto
+
+Esta é a decisão de design que mais vale defender, porque a alternativa é sedutora.
+
+A regra de alto valor da spec é: ordene os `priceCents` **distintos** cadastrados, calcule
+`k = ceil(HIGH_VALUE_PERCENTILE * n)`, e os `k` maiores preços são de alto valor. Seria natural
+a função de decisão receber a assinatura e calcular isso. Não recebe: ela recebe um `boolean`
+já resolvido.
+
+**Porque são duas responsabilidades diferentes, e só uma delas é uma regra:**
+
+- _"quais planos são de alto valor"_ é uma pergunta **sobre o estado do banco**. A resposta
+  muda quando alguém cadastra um plano novo, sem nenhuma regra ter mudado. Exige
+  `SELECT DISTINCT price_cents FROM plans` — I/O, assíncrono, falível.
+- _"o que fazer com um cancelamento de alto risco numa assinatura de alto valor"_ é uma
+  **política**. Não depende de estado nenhum.
+
+Se a regra pura fizesse a consulta, ela deixaria de ser pura e de ser síncrona, e todo teste de
+política precisaria de um banco ou de um mock de repositório — matando as três vantagens da
+seção 8 de uma vez.
+
+E há uma consequência prática imediata: o corte é **derivado dos dados**, como a spec exige
+("o avaliador pode alterar preços do seed e revalidar"). A camada que calcula o booleano lê os
+preços reais; a regra não precisa saber que percentil existe. Repare que `decision.rules.ts`
+**não importa `HIGH_VALUE_PERCENTILE`** — a constante só aparece em quem deriva o corte.
+
+O mesmo raciocínio vale para `timedOut`: quem cronometra o `SCORING_TIMEOUT_MS` é o orquestrador
+do agente, não a regra. A regra só recebe o veredito.
+
+**Onde isso aparece hoje:** em `scenarios.spec.ts` há uma função `highValuePriceCents()` que
+aplica a fórmula sobre os `plans` do contracts. Ela está marcada no código como **andaime de
+teste**, não implementação: serve para traduzir "qual plano" em `isHighValue` e alimentar a
+regra na validação cruzada. A versão de produção, que lê do banco, é de uma tarefa futura — e o
+fato de a regra não notar a diferença entre as duas é justamente a prova de que a separação
+funciona.
+
+### 13. Formato da entrada e da saída
+
+**Entrada — união discriminada, não campos opcionais:**
+
+```ts
+type DecisionInput =
+  { timedOut: true } | { timedOut: false; risk: number; isHighValue: boolean };
+```
+
+A alternativa seria `{ timedOut: boolean; risk?: number; isHighValue: boolean }`. Rejeitada:
+ela permite escrever o estado impossível `{ timedOut: true, risk: 0.85 }`, e obriga todo leitor
+de `risk` a lembrar de checar `undefined`. Com a união, o compilador só libera `input.risk`
+depois de o código provar que o scoring respondeu. **No timeout não existe risco — e não existir
+é diferente de ser zero.** Zero seria o risco mais baixo possível e levaria a `CANCELLED`, que é
+o oposto do que a spec manda.
+
+`isHighValue` também só aparece no ramo com risco: no timeout a decisão é conservadora
+independentemente do valor da assinatura, e oferecer o campo ali sugeriria uma influência que
+não existe.
+
+**Saída — `risk` não faz parte da `Decision`:**
+
+```ts
+interface Decision {
+  band: RiskBand;
+  outcomeType: OutcomeType;
+  humanReason?: HumanReason; // só quando outcomeType é HUMAN_RETENTION
+}
+```
+
+Quem tinha o risco é o chamador — ele já o conhece e é quem vai persistir. Devolvê-lo criaria
+duas fontes para o mesmo dado, e no caminho de timeout não haveria valor nenhum para colocar
+(cair num `risk: 0` de conveniência seria exatamente a invenção de número que a spec proíbe).
+
+`humanReason` é opcional **e tipado como união dos três motivos** (`HumanReason`), não como
+`string` solta: um motivo novo tem que ser declarado em `HUMAN_REASON` para existir.
+
+### 14. Validação cruzada com os 7 cenários
+
+Os testes de regra provam que cada peça faz o que eu digo que faz. `scenarios.spec.ts` prova
+que o conjunto bate com a spec congelada: para cada um dos 7 cenários, a decisão tem que
+reproduzir o `expectedBand`, o `expectedOutcome.type` e o `expectedOutcome.humanReason` que o
+contracts declara.
+
+| Cenário                    | Entrada           | Faixa | Outcome           | `humanReason`                       |
+| -------------------------- | ----------------- | ----- | ----------------- | ----------------------------------- |
+| `scenario-low`             | 0.15              | LOW   | `CANCELLED`       | —                                   |
+| `scenario-grey`            | 0.50              | GREY  | `HUMAN_RETENTION` | `grey zone`                         |
+| `scenario-high`            | 0.85, Basic       | HIGH  | `AUTOMATIC_OFFER` | —                                   |
+| `scenario-high-value-high` | 0.80, **Premium** | HIGH  | `HUMAN_RETENTION` | `high recurring value at high risk` |
+| `scenario-timeout`         | timeout           | GREY  | `HUMAN_RETENTION` | `scoring agent timeout`             |
+| `scenario-high-value-low`  | 0.10, **Premium** | LOW   | `CANCELLED`       | —                                   |
+| `scenario-grey-high-value` | 0.55, **Premium** | GREY  | `HUMAN_RETENTION` | `grey zone`                         |
+
+Os três últimos são os casos de borda que o contracts colocou de propósito: Premium em `LOW`
+cancela direto, e Premium em `GREY` sai com `grey zone` — o alto valor não encosta em nenhum
+dos dois. **Os 7 batem.**
+
+A comparação do `humanReason` é por igualdade literal com a string do cenário. A spec diz que a
+avaliação olha a semântica, não a letra — mas, já que os cenários trazem exemplos, usar
+exatamente esses textos torna o teste uma verificação forte em vez de uma aproximação.
+
+### 15. Uso de IA (Tarefa 02)
+
+Feita com assistência de IA (Claude Code), com revisão minha a cada passo, nos mesmos termos da
+seção 7 (Uso de IA) da Tarefa 01.
+
+Nesta tarefa vale registrar dois pontos específicos:
+
+- **A separação em duas regras e o formato da entrada foram decisão de design discutida**, não
+  geração automática: união discriminada em vez de `risk?: number`, `risk` fora da `Decision`,
+  e o timeout não reaproveitando `decideOutcome(GREY, ...)`. Cada uma está defendida acima.
+- **Os testes foram verificados por mutação.** Não aceitei "41 testes passando" como prova:
+  quebrei a regra de quatro formas diferentes (as da tabela da seção 11) e confirmei que os
+  testes certos falham em cada caso. Essa é a diferença entre ter cobertura e ter garantia.
