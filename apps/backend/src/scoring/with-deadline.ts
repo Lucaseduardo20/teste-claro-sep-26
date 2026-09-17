@@ -21,20 +21,23 @@ export type DeadlineResult<T> = { timedOut: false; value: T } | { timedOut: true
  * dispara; a corrida de fato acontece. Uma flag `simulateTimeout` devolvida na hora
  * testaria o `if` que lê a flag, não o mecanismo.
  *
- * ## Os dois vazamentos que esta função fecha
+ * ## O vazamento que esta função fecha: o timer
  *
- * 1. **O timer.** Se a operação responde primeiro e ninguém chama `clearTimeout`, o
- *    `setTimeout` continua agendado até o fim do prazo. Num processo isso é memória
- *    retida a cada chamada; num teste é pior — o Node mantém o event loop vivo enquanto
- *    houver timer pendente, e a suíte trava esperando um relógio que não interessa mais.
- *    O `finally` limpa nos três desfechos (operação ganhou, deadline ganhou, operação
- *    falhou).
+ * Se a operação responde primeiro e ninguém chama `clearTimeout`, o `setTimeout`
+ * continua agendado até o fim do prazo. Num processo isso é memória retida a cada
+ * chamada; num teste é pior — o Node mantém o event loop vivo enquanto houver timer
+ * pendente, e a suíte fica travada esperando um relógio que não interessa mais. O
+ * `finally` limpa nos três desfechos: operação ganhou, deadline ganhou, operação falhou.
  *
- * 2. **A rejeição tardia.** Se o deadline ganha e a operação rejeita *depois*, ninguém
- *    está mais ouvindo aquela promessa: vira `unhandledRejection`, que no Node moderno
- *    derruba o processo. O `.catch()` registrado antes da corrida é um ouvinte
- *    silencioso que existe só para isso. Ele não engole erro nenhum do caminho normal —
- *    a corrida tem o seu próprio ramo de rejeição, logo abaixo.
+ * ## O vazamento que **não** precisa ser fechado aqui
+ *
+ * O reflexo seguinte seria proteger contra a *rejeição tardia*: se o deadline ganha e a
+ * operação rejeita depois, aquela promessa perdedora viraria `unhandledRejection` — que
+ * no Node moderno derruba o processo. Cheguei a escrever um `operation.catch(() => {})`
+ * para isso e depois **testei sem ele**: o teste continua passando. O motivo é que
+ * `Promise.race` anexa um handler a *todas* as promessas que recebe, e esse handler
+ * continua lá depois da corrida decidida. A rejeição tardia já é observada. O `.catch()`
+ * extra seria código morto se passando por proteção, então saiu.
  *
  * Erro da operação **não** é timeout: a rejeição se propaga para o chamador, que assim
  * consegue distinguir "o agente falhou" de "o agente demorou".
@@ -53,10 +56,6 @@ export async function withDeadline<T>(
       resolve({ timedOut: true });
     }, deadlineMs);
   });
-
-  // Ouvinte silencioso: cobre o caso de a operação rejeitar depois de já ter perdido a
-  // corrida. Sem ele, a rejeição ficaria sem tratamento e derrubaria o processo.
-  operation.catch(() => undefined);
 
   try {
     return await Promise.race([
