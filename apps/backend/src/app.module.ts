@@ -4,9 +4,10 @@ import { AppController } from "@/app.controller";
 import { AppService } from "@/app.service";
 import { AppLoggerMiddleware } from "@/common/middlewares/app-logger.middleware";
 import { DbModule } from "@/db/db.module";
+import { ScoringModule } from "@/scoring/scoring.module";
 
 @Module({
-  imports: [DbModule],
+  imports: [DbModule, ScoringModule],
   controllers: [AppController],
   providers: [AppService],
 })
