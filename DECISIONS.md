@@ -445,7 +445,84 @@ certo, varrer uma tabela de uma página é mais barato que qualquer índice. Par
 sendo escolhido, ou se popula volume, ou se força com `SET enable_seqscan = off;` (só para
 inspeção, nunca como configuração).
 
-<!-- EXPLAIN aqui -->
+#### Saída real do `EXPLAIN`
+
+Rodei em dois níveis de volume, porque um só não responde a pergunta.
+
+**Nível 1 — com o seed (58 cancelamentos, 1 página de heap).** Todos os quatro planos dão
+`Seq Scan`, exatamente como eu tinha previsto acima:
+
+```
+ Sort  (cost=2.10..2.15 rows=18 width=99) (actual time=0.026..0.027 rows=18 loops=1)
+   Sort Key: created_at DESC
+   ->  Seq Scan on cancellations  (cost=0.00..1.73 rows=18) (actual time=0.006..0.011 rows=18)
+         Filter: (subscription_id = '8eb7c37e-...'::uuid)
+         Rows Removed by Filter: 40
+         Buffers: shared hit=1
+ Execution Time: 0.063 ms
+```
+
+O planner está **certo**: a tabela inteira cabe em uma página (`Buffers: shared hit=1`), e ler
+essa página é mais barato que qualquer travessia de índice. Índice nenhum ia ser usado aqui, e
+insistir seria otimização de fantasia.
+
+**Nível 2 — com 300 mil cancelamentos.** Este é o nível em que a decisão de indexar se prova ou
+se desmente. Rodei num banco descartável (`explain_lab`), com `VACUUM ANALYZE` antes de medir:
+
+```
+=== 1. cancelamentos de uma assinatura  →  cancellations_subscription_id_idx ===
+ Sort  (cost=1860.75..1862.24 rows=595 width=210) (actual time=2.369..2.395 rows=600 loops=1)
+   Sort Key: created_at DESC
+   ->  Bitmap Heap Scan on cancellations  (actual time=0.175..2.226 rows=600 loops=1)
+         Recheck Cond: (subscription_id = '00000000-...-000000000042'::uuid)
+         Heap Blocks: exact=600
+         ->  Bitmap Index Scan on cancellations_subscription_id_idx
+               (cost=0.00..8.88 rows=595) (actual time=0.103..0.104 rows=600 loops=1)
+               Index Cond: (subscription_id = '00000000-...-000000000042'::uuid)
+               Buffers: shared read=3
+ Execution Time: 2.466 ms
+```
+
+O índice é escolhido, e o número que importa é o `Buffers` do `Bitmap Index Scan`: **3 páginas**
+para localizar 600 linhas dentro de 300 mil. Sem o índice, a mesma consulta varreria as 7.550
+páginas da tabela.
+
+```
+=== 2. agregação do GET /metrics  →  cancellations_outcome_type_band_idx ===
+ Finalize GroupAggregate  (cost=1000.45..5718.34 rows=9) (actual time=20.565..21.801 rows=3)
+   Group Key: outcome_type, band
+   Buffers: shared hit=3 read=255
+   ->  Gather Merge   Workers Launched: 2
+         ->  Partial GroupAggregate  (actual time=4.891..14.120 rows=3 loops=3)
+               ->  Parallel Index Only Scan using cancellations_outcome_type_band_idx
+                     on cancellations  (cost=0.42..3778.42 rows=125000)
+                     (actual time=0.037..6.897 rows=100000 loops=3)
+                     Heap Fetches: 0
+                     Buffers: shared hit=3 read=255
+ Execution Time: 21.844 ms
+```
+
+**`Index Only Scan` com `Heap Fetches: 0`** — é literalmente o que eu argumentei ao escolher o
+composto em vez de dois índices de coluna única: as duas colunas do `GROUP BY` estão no índice,
+então a agregação inteira se resolve sem tocar no heap uma única vez. O ganho aparece no
+tamanho lido:
+
+| Estrutura                             | Tamanho | Páginas lidas na agregação |
+| ------------------------------------- | ------- | -------------------------- |
+| heap de `cancellations`               | 59 MB   | (seria ~7.550)             |
+| `cancellations_outcome_type_band_idx` | 2 MB    | **258**                    |
+
+**Uma armadilha que vale registrar.** Na primeira tentativa eu gerei o volume dentro de uma
+transação com `ROLLBACK`, para não sujar o banco de desenvolvimento — e ali o planner escolheu
+`Parallel Seq Scan`, contrariando o que eu tinha afirmado. O motivo não é o índice ser ruim: é
+que o _visibility map_ só é marcado pelo `VACUUM`, e linhas recém-inseridas numa transação
+aberta nunca passaram por um. Sem o `all-visible`, um `Index Only Scan` teria que buscar cada
+tupla no heap para checar visibilidade — e aí o seq scan é mesmo melhor. Com o `VACUUM ANALYZE`
+do laboratório isolado, `Heap Fetches` cai para zero e o índice ganha.
+
+Ou seja: o índice do `/metrics` não é só uma aposta — ele se paga em volume real. Mas depende
+de a tabela estar vacuumizada, o que em produção o autovacuum faz e num benchmark improvisado
+não acontece.
 
 ### 5. Como rodar
 
