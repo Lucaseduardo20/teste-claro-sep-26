@@ -1,141 +1,211 @@
-# Teste técnico - Dev Sr Fullstack (Claro / Experimentações)
+# Cancelamento com Retenção Inteligente
 
-Cenário: **Cancelamento com Retenção Inteligente**. PoC fullstack de auto-atendimento de cancelamento de assinatura com uma camada de IA que reduz o custo de retenção humana.
+PoC de um fluxo de auto-atendimento de cancelamento de assinatura com uma camada de IA que
+decide, caso a caso, o que fazer — e mede quanto isso economiza.
 
-> [`TESTE.md`](./TESTE.md) reúne escopo, regras, prazos e critérios de aceite.
+## O problema
 
-## A PoC
+Antes deste sistema, **todo** cancelamento ia para retenção humana: um especialista atendia
+cada assinante que clicava em "cancelar", a R$ 15 por caso, inclusive os que já tinham decidido
+e não mudariam de ideia.
 
-Antes desta automação, todo cancelamento de assinatura ia para a retenção humana, valorado a R$ 15 por caso. A maior parte não precisa de gente: uma parte dos assinantes vai cancelar de todo modo e outra aceita uma oferta.
+Quando um cancelamento começa, um **Agente de Scoring** atribui um risco de churn (0.00 a 1.00)
+a partir do histórico do assinante — engajamento, pagamentos, tempo de casa, o motivo escrito.
+Esse risco separa três caminhos:
 
-A PoC coloca um Agente de Scoring na frente da decisão. Quando o assinante inicia um cancelamento, o agente estima o risco de churn (0.00 a 1.00) a partir dos dados do assinante e da assinatura, e o risco escolhe o caminho:
+| Risco                 | Faixa             | O que o sistema faz                   |
+| --------------------- | ----------------- | ------------------------------------- |
+| `< 0.30`              | baixo             | cancela direto, sem oferta            |
+| `>= 0.30` e `<= 0.70` | **zona cinzenta** | encaminha para retenção humana        |
+| `> 0.70`              | alto              | faz uma oferta de retenção automática |
 
-| Faixa         | Risco                 | Caminho                       |
-| ------------- | --------------------- | ----------------------------- |
-| Baixo risco   | `< 0.30`              | Cancela direto, sem oferta    |
-| Zona cinzenta | `>= 0.30` e `<= 0.70` | Retenção humana               |
-| Alto risco    | `> 0.70`              | Oferta de retenção automática |
+Com uma regra secundária: numa assinatura de **alto valor recorrente**, a oferta automática é
+interceptada e o caso vai para um humano — nesses, vale pagar o atendimento.
 
-Duas exceções seguem para humano: a zona cinzenta (o agente não tem certeza) e a assinatura de alto valor em risco alto, cuja oferta automática é interceptada. Alto valor é o top 20% dos preços de plano distintos.
+O ganho é o que sobra no meio: os extremos passam a ser resolvidos sozinhos, e só a zona
+cinzenta chega ao especialista. É esse **custo evitado** que a PoC existe para demonstrar.
 
-Um segundo agente, opcional no escopo, classifica o motivo do cancelamento em categoria canônica. Falha dele não derruba o resultado.
+## Rodar
 
-O ganho que a PoC mede é o custo evitado: casos que iriam para humano antes, menos os que vão agora, a R$ 15 cada. Regras completas e fórmulas em [`TESTE.md`](./TESTE.md#regras-de-decisão), linguagem do domínio em [`CONTEXT.md`](./CONTEXT.md).
+Pré-requisitos: **Node 22+**, **pnpm 11+**, **Docker com Compose V2** (`docker compose`, com
+espaço).
+
+### Caminho 1 — subir tudo com um comando
+
+```bash
+cp .env.example .env     # credenciais do Postgres (só na primeira vez)
+docker compose up        # Postgres + API + frontend
+```
+
+O container da API aplica as migrations e carrega os 7 cenários antes de começar a servir, então
+o sistema já sobe navegável. Quando os três estiverem de pé:
+
+| O quê                | Onde                           |
+| -------------------- | ------------------------------ |
+| Fluxo (frontend)     | <http://localhost:3001>        |
+| API                  | <http://localhost:3000>        |
+| Documentação OpenAPI | <http://localhost:3000/docs>   |
+| Saúde da API         | <http://localhost:3000/health> |
+
+> **Nota honesta:** o `docker compose up` completo **não foi executado nesta máquina** — o
+> Docker daqui é 20.10, só com Compose V1. O que **foi** validado: `docker build` de cada
+> Dockerfile passa, o servidor standalone do frontend roda e serve as telas com dados reais, e
+> o `docker-compose.yml` é YAML válido com os três serviços. A orquestração em si é o item que
+> pede uma conferida num ambiente com Compose V2.
+
+### Caminho 2 — desenvolvimento
+
+```bash
+pnpm install
+cp .env.example .env                             # credenciais do compose
+cp apps/backend/.env.example apps/backend/.env   # DATABASE_URL e PORT
+cp apps/frontend/.env.example apps/frontend/.env # URL da API
+
+pnpm db:up                                       # só o Postgres, em localhost:5432
+pnpm --filter @repo/backend db:migrate           # cria o schema
+pnpm --filter @repo/backend db:seed              # carrega os 7 cenários
+
+pnpm dev                                         # API em :3000, frontend em :3001
+```
+
+Para rodar só um dos dois: `pnpm dev:backend` ou `pnpm dev:frontend`.
+
+A lista completa de comandos do dia a dia (banco, Prisma, qualidade, `psql`) está na
+[seção 6 do DECISIONS.md](./DECISIONS.md).
+
+### Testes
+
+```bash
+pnpm verify    # lint + typecheck + testes unitários + e2e, nos três pacotes
+```
+
+São **142 testes**: 12 no contracts, 98 unitários no backend, 19 e2e e 13 no frontend.
+
+Os e2e batem num Postgres de verdade. Sem o banco de pé eles são **pulados com aviso**, para o
+`verify` continuar verde num clone sem Docker; no CI, `E2E_REQUIRE_DB=1` transforma a ausência
+do banco em erro. O raciocínio está na [seção 31](./DECISIONS.md).
+
+## Arquitetura
+
+```
+packages/contracts            especificação congelada (tipos, enums, limiares, 7 cenários)
+        │
+        ▼
+src/decision/                 REGRA PURA — risco → faixa → outcome
+        │                     sem HTTP, sem banco, sem framework
+        ▼
+src/scoring/                  PORT & ADAPTER — agente de scoring + deadline real
+        │                     o mock demora; quem corta é o Promise.race do service
+        ▼
+src/plans/                    ALTO VALOR — corte derivado de SELECT DISTINCT price_cents
+        │
+        ▼
+src/cancellations/            USE CASE — orquestra os três acima e persiste
+        │                     testável sem HTTP e sem banco
+        ▼
+src/*/​*.controller.ts         HTTP — controllers finos, validação por DTO, filtro global
+        │
+        ▼
+apps/frontend                 4 telas: lista → motivo → processando → resultado
+```
+
+As decisões-âncora, uma frase cada — o detalhe está no
+[**DECISIONS.md**](./DECISIONS.md), que é o documento de defesa técnica:
+
+- **A regra de decisão é pura e isolada** (§8–§13). `toBand(risk)` e `decideOutcome(band,
+isHighValue)` não importam nada além dos limiares do contracts; é isso que permite 41 testes
+  de fronteira rodando em ~120 ms.
+- **Os limites são exclusivos, e isso é testado** (§11). `0.30` e `0.70` exatos caem na zona
+  cinzenta; verifiquei por mutação que os testes quebram se alguém trocar `<` por `<=`.
+- **O timeout do scoring é real** (§16–§18). O mock **espera** de verdade e quem decide "demorou
+  demais" é um `Promise.race` no orquestrador, não uma flag devolvida pelo agente.
+- **O alto valor é derivado do banco** (§26). `k = ceil(HIGH_VALUE_PERCENTILE * n)` sobre os
+  preços distintos cadastrados — mude os preços do seed e o corte muda junto.
+- **Os campos indecididos são nullable sem default** (§1.2). Um cancelamento nasce antes de ser
+  decidido, e `NULL` é o único valor que significa "ainda não sei".
+- **Prisma como ORM** (§2), com os índices justificados um a um e `EXPLAIN` medido em dois
+  níveis de volume (§4).
+
+## Escopo: o que está pronto e o que ficou de fora
+
+### Entregue e testado
+
+| Área                | O que tem                                                                                    |
+| ------------------- | -------------------------------------------------------------------------------------------- |
+| Modelagem           | 7 entidades, 9 enums nativos, 6 índices justificados, migration versionada, seed idempotente |
+| Regras de decisão   | camada pura, limites exclusivos, interceptação de alto valor, fallback de timeout            |
+| Agente de Scoring   | mock determinístico por `subscriptionId`, deadline real por `Promise.race`, DI por token     |
+| Endpoints de núcleo | `POST /cancellations`, `GET /subscriptions`, `GET /cancellations/:id`                        |
+| Frontend            | as 4 telas do fluxo, Server Components, Server Action, `<Suspense>`, acessibilidade básica   |
+| Infra transversal   | validação por DTO, exception filter global, logging estruturado (pino), OpenAPI em `/docs`   |
+| Testes              | 142, em três níveis: função pura, use case sem I/O, e2e com Postgres real                    |
+| Entrega             | `docker compose up` com os três serviços, CI no GitHub Actions                               |
+
+### Deixado de fora, conscientemente
+
+Não é lista de pendências esquecidas: é **priorização**. O núcleo avaliado — decisão, scoring,
+orquestração, persistência — está completo e testado. Os cortes são todos de borda, e cada um
+tem um motivo:
+
+| Fora                                              | Por quê                                                                                                                                                                                                                                        |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agente de Classificação** (categoria do motivo) | Opcional no escopo, e **a decisão não depende dele**: o outcome sai do risco e do valor da assinatura. A coluna `reason_category` já existe no schema, nullable, esperando.                                                                    |
+| **`POST /cancellations/:id/accept` e `/decline`** | Stretch. O fluxo _até_ a oferta está completo — ela é criada, persistida e mostrada na tela; o que falta é a ação sobre ela. Na tela, os botões aparecem desabilitados com aviso, em vez de escondidos.                                        |
+| **`GET /metrics`** (custo evitado agregado)       | Stretch. O dado já está no banco e o índice `(outcome_type, band)` foi criado e medido justamente para essa agregação (§4) — falta expor.                                                                                                      |
+| **LLM real no scoring**                           | Stretch. A arquitetura port/adapter deixa isso a **uma linha de distância**: trocar `useFactory` por `useClass: OpenAIScoringAgent` no `scoring.module.ts` (§16). O mock determinístico cobre o fluxo inteiro e torna os testes reprodutíveis. |
+| **Testes de browser (Playwright)**                | Stretch. O fluxo foi percorrido à mão no browser nos quatro desfechos, e a lógica não-óbvia do front (moeda, mapa de mensagens) tem teste unitário.                                                                                            |
+
+## Observações sobre o material recebido
+
+Duas coisas encontradas durante a implementação, registradas porque o TESTE.md pede:
+
+**1. Uma tensão na spec.** `ScoringResult` declara `risk: number` (obrigatório) e, no mesmo
+tipo, `timedOut: boolean`. Quando o agente estoura o `SCORING_TIMEOUT_MS` não existe risco para
+reportar — e a spec é clara ao dizer que nesse caso o risco fica indefinido. O tipo, portanto,
+não consegue representar o estado que a própria spec descreve. **Não alterei o contracts**: o
+adapter continua honrando `ScoringResult`, e o service devolve um tipo próprio
+(`ScoringOutcome`), uma união discriminada em que o ramo de timeout não tem onde guardar um
+risco. Raciocínio completo na [seção 20](./DECISIONS.md).
+
+**2. Duas quebras pré-existentes do scaffold, corrigidas.** Nenhuma aparecia no `pnpm verify`,
+porque o build do backend não está entre as tarefas que ele roda:
+
+- `nest build` e `nest start` morriam no Node 22 antes de ler o projeto: o
+  `@angular-devkit/schematics` faz `require()` de `ora@9` (ESM) dentro de um ciclo de módulos, e
+  o Node recusa com `ERR_REQUIRE_CYCLE_MODULE`. Corrigido com um override transitivo fixando
+  `ora` em 5.x, escopado ao `@nestjs/cli`.
+- `pnpm dev:backend` nunca subiu: o `nest start` não roda o `tsc-alias`, então os aliases `@/*`
+  chegavam sem resolver ao `dist`. O script `dev` agora roda `tsc --watch`, `tsc-alias --watch`
+  e `node --watch` juntos.
+
+Diagnóstico completo na [seção 30](./DECISIONS.md).
 
 ## Mapa do repositório
 
-Monorepo com [pnpm workspaces](https://pnpm.io/workspaces) e [Turborepo](https://turborepo.com).
-
-```text
-.
-├── TESTE.md               # especificação do desafio (leia primeiro)
-├── RUBRICA.md             # critérios de avaliação e pesos
-├── AVALIACAO.md           # ficha preenchível de avaliação
-├── CONTEXT.md             # linguagem ubíqua do domínio
-├── VAGA.md                # descrição da vaga
-├── AGENTS.md              # instruções para agentes de código
-├── apps/
-│   ├── backend/           # @repo/backend  - NestJS 12 + Postgres (scaffold)
-│   └── frontend/          # @repo/frontend - Next.js 16 + Tailwind 4 (scaffold)
-├── packages/
-│   ├── contracts/         # @repo/contracts       - ESPECIFICAÇÃO CONGELADA
-│   ├── tsconfig/          # @repo/tsconfig        - tsconfigs compartilhados
-│   ├── lint/              # @repo/lint            - ESLint compartilhado
-│   └── prettier-config/   # @repo/prettier-config - Prettier compartilhado
-├── docker-compose.yml     # Postgres (você adiciona API e frontend)
-├── turbo.json             # pipeline de tarefas
-└── pnpm-workspace.yaml    # pacotes do workspace
-```
-
-## Começar
-
-Requisitos: Node 22+, pnpm 11+, Docker.
-
-```bash
-pnpm install         # instala e liga os pacotes do workspace
-cp .env.example .env # variáveis do docker compose (Postgres)
-pnpm db:up           # sobe o Postgres
-pnpm dev:backend     # API em http://localhost:3000 (GET /health)
-pnpm dev:frontend    # UI em http://localhost:3001
-```
-
-Cada app tem seu próprio `.env.example` (`apps/backend/`, `apps/frontend/`); copie para `.env` na mesma pasta se precisar mudar porta ou URL.
-
-## Verificar
-
-```bash
-pnpm verify   # lint + typecheck + testes dos três pacotes, via turbo
-```
-
-Saída esperada hoje (baseline do scaffold): tudo verde.
-
-```text
-@repo/contracts: lint, typecheck, test (12 testes)   -> verde
-@repo/backend:   lint, typecheck, test, test:e2e     -> verde
-@repo/frontend:  lint, typecheck                     -> verde
-Tasks: 10 successful, 10 total
-```
-
-Outros comandos úteis:
-
-| Comando                                | O que faz                                                     |
-| -------------------------------------- | ------------------------------------------------------------- |
-| `pnpm build`                           | build de produção dos três pacotes, na ordem das dependências |
-| `pnpm test`                            | testes unitários                                              |
-| `pnpm lint` / `pnpm typecheck`         | tarefas isoladas                                              |
-| `pnpm format`                          | Prettier em todos os pacotes                                  |
-| `pnpm --filter @repo/backend <script>` | roda um script em um pacote específico                        |
-
-O turbo cacheia cada tarefa: rodar `pnpm verify` duas vezes sem mudar nada é instantâneo.
-
-## O que este repositório já entrega
-
-O objetivo do scaffold é remover o atrito de infraestrutura (monorepo configurado, banco, conexão, build, lint, typecheck, testes rodando), **não** o trabalho avaliado. Nada de modelagem, regra de decisão, agente ou tela vem pronto.
-
-| Já pronto                                                                                                     | É o teste (você faz)                                                     |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Monorepo com turbo (build ordenado, cache, tarefas por pacote) e configs compartilhadas de TS/ESLint/Prettier | Migrations, seed, modelagem, os 6+ endpoints, agentes, regras de decisão |
-| Bootstrap do Nest com `/health`, pool `pg` injetável e middleware de log                                      | Serviços de API e frontend no compose                                    |
-| Compose com Postgres + healthcheck                                                                            | As 4 telas do fluxo, Server Actions, `<Suspense>`, acessibilidade        |
-| Next.js 16 com Tailwind 4, shadcn/ui, tokens, layout `pt-BR`                                                  | Testes do caminho crítico (regras de decisão, fluxo de cancelamento)     |
-| Testes de exemplo verdes (contracts, backend unit e e2e)                                                      | Consumir `@repo/contracts` e mapear o domínio para o schema              |
-| `@repo/contracts` compilado e testado                                                                         | CI do repositório                                                        |
-
-Detalhes de cada pacote: [`packages/contracts/README.md`](./packages/contracts/README.md), [`apps/backend/README.md`](./apps/backend/README.md) e [`apps/frontend/README.md`](./apps/frontend/README.md).
-
-## Observação sobre a spec
-
-`packages/contracts/` é especificação congelada e não foi alterada. Uma ambiguidade encontrada
-ao implementar o Agente de Scoring, registrada aqui conforme pede o
-[`TESTE.md`](./TESTE.md):
-
-**`ScoringResult.risk` é obrigatório (`risk: number`), mas o mesmo tipo declara
-`timedOut: boolean`.** Quando o agente estoura o `SCORING_TIMEOUT_MS` não existe risco para
-reportar — e a spec é clara em outro ponto ao dizer que, no timeout, o risco fica indefinido
-("não invente um número"). O tipo, portanto, não consegue representar o estado que a própria
-spec descreve.
-
-Não alterei o contracts. O adapter continua honrando `ScoringResult`, e o `ScoringService`
-devolve um tipo próprio (`ScoringOutcome`), uma união discriminada em que o ramo de timeout
-simplesmente não tem onde guardar um risco. O raciocínio completo está na seção 20 do
-[`DECISIONS.md`](./DECISIONS.md).
-
-## Quebras pre-existentes do scaffold, corrigidas
-
-Duas coisas nao funcionavam no repositorio recebido, no Node 22, e nenhuma delas aparecia no
-`pnpm verify` (que roda lint, typecheck e testes — o build do backend nao esta entre eles):
-
-1. **`nest build` e `nest start` morriam antes de ler o projeto.** O
-   `@angular-devkit/schematics` faz `require()` de `ora@9`, que e ESM, dentro de um ciclo de
-   modulos; o Node 22 recusa com `ERR_REQUIRE_CYCLE_MODULE`. Corrigido com um override
-   transitivo fixando `ora` em 5.x (ultima versao CJS), escopado ao `@nestjs/cli` e ao
-   `@angular-devkit/schematics`.
-2. **`pnpm dev:backend` nunca subiu.** O `nest start` nao roda o `tsc-alias`, entao os aliases
-   `@/*` chegavam sem resolver ao `dist` e o processo morria em `ERR_MODULE_NOT_FOUND`. O script
-   `dev` agora roda `tsc --watch`, `tsc-alias --watch` e `node --watch` juntos.
-
-Detalhes e o diagnostico completo na secao 30 do [`DECISIONS.md`](./DECISIONS.md).
+| Caminho               | O que é                                                                       |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `packages/contracts/` | **Especificação congelada.** Tipos, enums, limiares e os 7 cenários. Intacta. |
+| `apps/backend/`       | API NestJS + Prisma + Postgres                                                |
+| `apps/frontend/`      | Next.js 16 (App Router) + Tailwind 4 + shadcn/ui                              |
+| `DECISIONS.md`        | **A defesa técnica.** Uma seção por etapa, com o porquê de cada decisão.      |
+| `CONTEXT.md`          | Linguagem ubíqua do domínio (pt-BR)                                           |
+| `TESTE.md`            | O enunciado original                                                          |
 
 ## Uso de IA
 
-Você pode usar IA para fazer o teste. Revise o resultado, entenda as decisões e esteja pronto para explicar o código na conversa final. Registre no README como usou a ferramenta ou diga que não usou. Nenhuma das duas escolhas reduz a nota; o que reprova está na seção **Uso de IA** de [`TESTE.md`](./TESTE.md#uso-de-ia).
+Este projeto foi feito **com assistência de IA** (Claude Code), em sessão interativa, com
+revisão minha a cada passo. Assumo a responsabilidade pelo resultado e consigo defender cada
+decisão.
+
+Cada etapa tem a sua própria seção "Uso de IA" no [DECISIONS.md](./DECISIONS.md) (§7, §15, §22,
+§33, §40), registrando o que foi dirigido por mim, o que foi discutido e — principalmente — **o
+que a verificação empírica mudou no código**. Alguns exemplos do que está lá:
+
+- Um `operation.catch()` no wrapper de timeout foi escrito, **testado sem ele, provado
+  desnecessário e removido** — `Promise.race` já anexa o handler. Teria ficado para sempre no
+  código com um comentário convincente e errado.
+- Os testes das regras de decisão foram validados **por mutação**: quebrei a regra de quatro
+  formas e conferi que os testes certos falham em cada caso.
+- O `EXPLAIN` foi medido em dois níveis de volume, e a primeira medição **contrariou** o que eu
+  tinha escrito. Investiguei (era o _visibility map_ não marcado dentro de uma transação aberta),
+  refiz num laboratório isolado e documentei os dois resultados em vez de apagar o que não bateu.

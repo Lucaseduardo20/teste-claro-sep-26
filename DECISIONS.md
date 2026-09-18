@@ -1708,3 +1708,127 @@ Desta tarefa vale registrar:
   (`node_modules/next/dist/docs/`) foi consultada antes de escrever as páginas, em vez de
   assumir as APIs de versões anteriores. Foi de lá que vieram o formato de `PageProps<"/rota">`
   com `params` assíncrono e o comportamento do `loading.tsx`.
+
+---
+
+## Tarefa 06 — Empacotamento, CI e fecho
+
+Esta etapa não acrescenta comportamento. Ela existe para que um avaliador consiga sair do zero
+até o fluxo rodando, e para que o repositório se explique sozinho.
+
+### 41. `docker compose up`: o que foi validado e o que não foi
+
+O compose sobe três serviços: `db` (Postgres, como já era), `backend` e `frontend`.
+
+**A máquina em que isto foi desenvolvido tem Docker 20.10 com Compose V1** (`docker-compose`),
+sem `docker compose`. Então o `up` completo **não foi executado aqui**. Em vez de entregar o
+arquivo no escuro, validei tudo que dava, subindo os containers à mão numa rede Docker — que é
+exatamente o que o compose faria:
+
+| O quê                                                               | Validado?                    |
+| ------------------------------------------------------------------- | ---------------------------- |
+| `docker build` de cada Dockerfile                                   | ✅ passa                     |
+| Entrypoint da API aplicando migrations e carregando o seed          | ✅ log conferido             |
+| API respondendo em container (`/health`, `/subscriptions`)          | ✅                           |
+| Comando do `healthcheck` do compose, rodado dentro do container     | ✅ exit 0                    |
+| Frontend em container falando com a API **pelo hostname** `backend` | ✅ telas com dados reais     |
+| Resolução de nome entre containers na rede                          | ✅                           |
+| O arquivo `docker-compose.yml` em si (parsing, `depends_on`, ordem) | ❌ **precisa de Compose V2** |
+
+O que sobra sem validação é a orquestração: se o `depends_on: service_healthy` respeita a ordem,
+se as portas casam. É o item a conferir num ambiente com Compose V2 antes de entregar.
+
+**Decisões do compose que valem nota:**
+
+- **Contexto de build na raiz do monorepo**, não em `apps/backend`. O backend depende de
+  `@repo/contracts` por workspace; um contexto restrito à pasta do app deixaria a dependência
+  de fora do build.
+- **`depends_on: condition: service_healthy`**, não `service_started`. O Postgres aceita conexão
+  bem depois de o container subir, e o entrypoint roda migration na largada — com
+  `service_started` a corrida seria perdida de vez em quando, que é o pior tipo de falha.
+- **`API_URL` e `NEXT_PUBLIC_API_URL` apontam para lugares diferentes**, de propósito: o
+  servidor do Next fala com `http://backend:3000` (rede interna) e o browser falaria com
+  `http://localhost:3000`. Foi para isto que a Tarefa 05 deu precedência ao `API_URL` (§34).
+- **Healthcheck com `node -e fetch(...)`** em vez de `curl`: a imagem slim não traz curl nem
+  wget, e instalar um só para o healthcheck seria peso morto numa imagem de runtime.
+
+### 42. Duas coisas que só apareceram rodando o container
+
+Montar a imagem e rodá-la revelou dois problemas que nenhuma verificação estática mostraria.
+
+**1. O container precisava de rede para subir, e levava ~50 segundos.** O entrypoint chamava
+`pnpm exec prisma migrate deploy`, e a cada boot o corepack baixava o pnpm do registry e o pnpm
+revalidava o lockfile inteiro ("Verifying lockfile against supply-chain policies — 1114
+entries"). Um container que depende do npmjs.org para iniciar é frágil de um jeito que só
+aparece no dia em que o registry está fora.
+
+A correção foi tirar o pnpm do caminho de runtime: o Dockerfile põe `node_modules/.bin` no
+`PATH` e o entrypoint chama `prisma` e `tsx` direto. O seed roda `tsx prisma/seed.ts` em vez de
+`prisma db seed`, porque o comando registrado no `prisma.config.ts` é `pnpm exec tsx ...` —
+pensado para a máquina de quem desenvolve, não para dentro da imagem.
+
+**Medido: de ~50s para 3s até a API responder, e sem rede.**
+
+**2. O Prisma reclamava de OpenSSL.** `Prisma failed to detect the libssl/openssl version to
+use, and may not work as expected. Defaulting to "openssl-1.1.x"`. Funcionava — mas por sorte,
+e o próprio Prisma pede para instalar. A imagem slim não traz OpenSSL; o Dockerfile passou a
+instalá-lo explicitamente.
+
+Aproveitando: a imagem do backend caiu de **1,21 GB para 790 MB** trocando
+`pnpm install --frozen-lockfile` por `pnpm install --frozen-lockfile --filter @repo/backend...`.
+Sem o filtro, o `node_modules` do frontend (Next, React, Tailwind) ia junto para uma imagem que
+nunca vai renderizar uma página.
+
+A imagem do frontend tem **266 MB** porque usa `output: "standalone"` do Next. Num monorepo
+pnpm isso não é detalhe de tamanho: o standalone empacota as dependências resolvidas, o que
+evita ter que copiar a árvore de symlinks do `node_modules` para dentro da imagem — a origem
+clássica do "funciona local, quebra no container".
+
+### 43. CI
+
+`.github/workflows/ci.yml`, em push e pull request, com um Postgres de serviço.
+
+Duas escolhas que não são óbvias:
+
+- **`E2E_REQUIRE_DB=1`.** Os e2e são pulados quando o Postgres não responde, para o `pnpm
+verify` continuar verde num clone sem Docker (§31). No CI isso seria um **falso verde**: o
+  banco existe lá, então a ausência dele tem que ser erro. Essa variável inverte o
+  comportamento exatamente onde deve ser invertido.
+- **A versão do pnpm sai do `packageManager`** do `package.json` da raiz, e não de um número
+  escrito no workflow. Dois lugares com a mesma versão é um lugar a mais para sair de sincronia.
+
+O job roda, em ordem: `install` → `migrate deploy` → `seed` → `verify` → `build`. O `build` vem
+depois de propósito: o `verify` não builda o backend (só lint, typecheck e testes), e foi
+justamente por isso que as duas quebras do `@nestjs/cli` (§30) passaram despercebidas no
+scaffold. Com o `build` no CI, isso não se repete.
+
+### 44. Higiene final
+
+Conferido antes de fechar:
+
+| Verificação                                       | Resultado                                      |
+| ------------------------------------------------- | ---------------------------------------------- |
+| `console.log` em código de produção               | nenhum                                         |
+| `any`, `as any`, `@ts-ignore`, `@ts-expect-error` | nenhum em todo o `src`                         |
+| `.only` / `fdescribe` esquecidos em teste         | nenhum                                         |
+| `.env` versionado                                 | só os três `.env.example`                      |
+| `packages/contracts/` alterado                    | intacto (zero diff em 33 commits)              |
+| `pnpm verify`                                     | verde, 142 testes                              |
+| Histórico                                         | 33 commits, Conventional Commits, incrementais |
+
+O `<!-- EXPLAIN aqui -->` da Tarefa 01 foi fechado com saída **medida**, em dois níveis de
+volume, incluindo o resultado que contrariou a minha previsão inicial e a investigação do porquê
+(§4).
+
+### 45. Uso de IA (Tarefa 06)
+
+Feita com assistência de IA (Claude Code), revisada por mim.
+
+O registro desta etapa é sobre **o que não foi validado**. A tentação, numa tarefa de
+empacotamento, é escrever o `docker-compose.yml`, ver que o YAML é válido e declarar pronto.
+Em vez disso: subi os containers à mão numa rede Docker para exercitar tudo que o compose faria,
+encontrei dois problemas reais de runtime (§42), corrigi, medi o ganho — e deixei explícito, no
+README e aqui, o único item que esta máquina não consegue testar.
+
+Preferir "não validei isto, e é isto que você precisa conferir" a um verde inventado é parte da
+entrega.
