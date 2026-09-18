@@ -1483,3 +1483,151 @@ O que vale registrar desta tarefa:
 - **A separação em três níveis de teste (seção 31) foi decisão consciente** sobre onde cada
   garantia custa menos: fórmula pura em milissegundos, orquestração sem I/O, e só o fluxo
   completo pagando o preço do banco.
+
+---
+
+## Tarefa 05 — Frontend do fluxo
+
+Quatro telas, navegação linear, consumindo a API da Tarefa 04. Escopo deliberadamente enxuto:
+o fluxo funcionando com o design system que o scaffold já traz, sem inventar paleta nem
+componente que não fosse necessário.
+
+| Tela | Rota                         | Tipo                        | O que faz                               |
+| ---- | ---------------------------- | --------------------------- | --------------------------------------- |
+| 1    | `/`                          | Server Component            | lista as assinaturas                    |
+| 2    | `/subscriptions/[id]/cancel` | Server + form cliente       | pede o motivo e dispara o `POST`        |
+| 3    | (sem rota própria — ver §35) | `isPending` + `loading.tsx` | "Analisando sua solicitação"            |
+| 4    | `/cancellations/[id]`        | Server Component            | o resultado, traduzido para o assinante |
+
+### 34. Server Component por padrão, cliente só onde precisa
+
+**Um único componente é `"use client"`**: o formulário da Tela 2 (`cancel-form.tsx`). Ele
+precisa de duas coisas que só existem no browser — o estado de envio (`isPending`) e a
+mensagem de erro sem recarregar a página.
+
+Todo o resto é Server Component, e isso tem consequência prática: **o browser nunca fala com a
+API**. As leituras acontecem no servidor e o `POST` vai por Server Action. Por isso o cliente
+de API (`lib/api.ts`) começa com `import "server-only"` — importá-lo de um componente cliente
+quebra o build, em vez de virar um vazamento descoberto em produção.
+
+A URL da API vem do ambiente, com `API_URL` tendo precedência sobre `NEXT_PUBLIC_API_URL`:
+em container os dois endereços são diferentes (o navegador fala com `localhost:3000`, o
+container do frontend fala com `http://backend:3000`).
+
+Na Server Action, o `subscriptionId` chega por `bind` e não por campo escondido no formulário —
+campo escondido é editável por quem abrir o DevTools. E o `redirect` fica **fora** do `try`:
+ele funciona lançando uma exceção de controle do Next, então dentro do `try` o `catch`
+engoliria o próprio redirecionamento e ele viraria uma mensagem de erro.
+
+### 35. A Tela 3 aparece nos dois lugares onde a espera existe
+
+A tela de processamento **não tem rota própria**, e isso é decisão, não atalho. O `POST
+/cancellations` é síncrono: ele só responde quando a decisão existe. Criar uma rota
+`/processing` significaria navegar para uma página que não tem o que fazer além de esperar um
+request que já está em voo em outro lugar.
+
+Em vez disso, o mesmo componente aparece nos dois pontos em que a espera de fato acontece:
+
+1. **No `isPending` do `useActionState`** — enquanto a Server Action roda o `POST`;
+2. **No `loading.tsx` da rota de resultado** — que o App Router embrulha num `<Suspense>`
+   automaticamente, enquanto o Server Component busca `GET /cancellations/:id`.
+
+O efeito é uma tela de processamento contínua do clique até o resultado, sem o "branco" entre
+a ação terminar e a próxima página renderizar.
+
+**E a espera é real.** Do outro lado, o Agente de Scoring simula 200–1500ms de latência, e o
+cenário de timeout leva os 3 segundos inteiros do deadline. Não há `setTimeout` fingindo
+trabalho: o componente fica no ar exatamente enquanto a decisão está sendo tomada. A latência
+que a Tarefa 03 tratou como problema técnico vira, aqui, o único momento em que o assinante
+percebe que existe uma análise acontecendo.
+
+### 36. O `humanReason` interno nunca chega ao assinante
+
+Esta é a decisão de produto da tarefa, e ela é a contrapartida direta da seção 10.
+
+Lá eu argumentei que os três caminhos até a retenção humana **precisam** de motivos distintos
+(`grey zone`, `high recurring value at high risk`, `scoring agent timeout`), porque quem atende
+a fila, quem opera o sistema e a métrica de custo evitado precisam distinguir os três. Aqui a
+conclusão é a oposta, e pelo mesmo raciocínio: **são dados operacionais, e o assinante não é o
+público deles**.
+
+Mostrar cada um seria ruim de um jeito diferente:
+
+- `grey zone` — vaza a régua interna de decisão: "você caiu na faixa em que não sabemos
+  decidir" não é informação útil para quem está cancelando;
+- `scoring agent timeout` — expõe uma **falha nossa** como se fosse explicação sobre ele;
+- `high recurring value at high risk` — diz ao assinante, em voz alta, que ele está recebendo
+  tratamento diferenciado por ser caro.
+
+Então os três produzem **a mesma mensagem**: "Vamos te conectar com um especialista". A regra
+mora numa função pura (`lib/outcome-copy.ts`) e tem teste travando exatamente isso: os três
+motivos geram um objeto idêntico, e nenhuma das quatro mensagens contém jargão do sistema
+(`grey`, `timeout`, `scoring`, `risk`, `band`, `outcome`, `churn`).
+
+O caso `outcome` ausente também é tratado — vira "em análise", não erro. É estado legítimo do
+domínio: o cancelamento nasce antes de ser decidido (seção 1.2).
+
+### 37. Acessibilidade, e um erro que só o browser mostrou
+
+O básico está coberto: `<label>` associado ao `textarea` por `htmlFor`/`id`, `aria-describedby`
+e `aria-invalid` ligados à mensagem de erro, `role="alert"` no erro, `role="status"` com
+`aria-live="polite"` na tela de processamento, e foco visível (herdado do `focus-visible:ring`
+do design system).
+
+Um detalhe que vale citar: numa lista de sete botões "Cancelar assinatura" idênticos, quem usa
+leitor de tela não consegue distinguir um do outro. Cada botão carrega o nome do plano num
+`<span class="sr-only">`, então o rótulo acessível vira "Cancelar assinatura do plano Premium".
+
+E um erro que eu **só encontrei olhando a árvore de acessibilidade no browser**: o
+`ProcessingScreen` renderizava o seu próprio `<main>`, e quando ele substituía o formulário da
+Tela 2 o resultado era um `<main>` dentro de outro — HTML inválido e dois marcos de navegação.
+A correção foi tirar a moldura do componente e deixar que o chamador a monte. Vale registrar
+que nem o `tsc` nem o ESLint pegariam isso.
+
+### 38. Testes: só a lógica que não é óbvia na tela
+
+O frontend ganhou 13 testes, todos sobre **funções puras**:
+
+- `formatCents` — os três preços do seed, o desconto quebrado (R$ 5,80), separador de milhar e
+  a garantia de que o locale é fixo em `pt-BR` e não o da máquina;
+- `outcomeCopy` — os quatro desfechos produzem mensagens distintas, e os testes de vazamento do
+  `humanReason` descritos na seção 36.
+
+Teste de componente e de browser (Playwright) ficaram fora: são stretch, e o que valia travar é
+a lógica que alguém pode quebrar sem perceber ao editar uma tela. A verificação do fluxo foi
+feita **manualmente no browser**, pelo caminho real — clicar na assinatura, escrever o motivo,
+esperar o processamento, ver o resultado — nos quatro desfechos.
+
+### 39. O que ficou de fora, e por quê
+
+| Fora do escopo                 | Por quê                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| Aceitar / recusar a oferta     | Endpoints de stretch (`/accept`, `/decline`) não implementados na API   |
+| Tela de métricas               | `GET /metrics` é stretch; sem ele não há o que renderizar               |
+| Testes de browser (Playwright) | Stretch; o fluxo foi verificado à mão nos quatro desfechos              |
+| `GET /subscriptions/:id`       | A API de núcleo tem três endpoints; a Tela 2 tira a assinatura da lista |
+
+Sobre os botões da oferta: eles **aparecem desabilitados**, com um aviso de que a ação ainda
+não está disponível. Escondê-los deixaria a tela mais limpa e menos honesta — o caminho existe
+no domínio e a tela deve mostrar que existe, sem fingir que funciona.
+
+Sobre o `GET /subscriptions/:id`: com 7 assinaturas, buscar a lista e filtrar é irrelevante. Num
+catálogo grande o certo seria um endpoint dedicado — mas inventar endpoint fora dos três de
+núcleo, numa tarefa cujo escopo dizia "não reescreva o backend", seria pior que a ineficiência.
+
+### 40. Uso de IA (Tarefa 05)
+
+Feita com assistência de IA (Claude Code), revisada por mim, nos mesmos termos das anteriores.
+
+Desta tarefa vale registrar:
+
+- **O fluxo foi percorrido no browser de verdade**, não só compilado: clicar, preencher,
+  esperar e ler o resultado nos quatro desfechos (cancelamento direto, oferta automática, alto
+  valor e timeout). Foi assim que o `<main>` aninhado apareceu — nenhuma ferramenta estática o
+  teria mostrado.
+- **A regra de não vazar o `humanReason` virou teste, não comentário.** É o tipo de decisão que
+  se perde na primeira vez que alguém "melhora" a mensagem de erro para ajudar no debug.
+- **O `AGENTS.md` do Next foi respeitado**: a documentação da versão instalada
+  (`node_modules/next/dist/docs/`) foi consultada antes de escrever as páginas, em vez de
+  assumir as APIs de versões anteriores. Foi de lá que vieram o formato de `PageProps<"/rota">`
+  com `params` assíncrono e o comportamento do `loading.tsx`.
