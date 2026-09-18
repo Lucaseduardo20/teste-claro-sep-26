@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Um push logo depois de outro no mesmo branch cancela a execução anterior: não
+# adianta gastar runner validando um commit que já foi substituído.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: lint + typecheck + testes
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: smart_retention
+        ports:
+          - 5432:5432
+        # Sem o healthcheck o job segue com o Postgres ainda subindo, e a migration
+        # falha por conexão recusada de forma intermitente.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d smart_retention"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/smart_retention
+      # No CI o banco existe, então um e2e pulado seria um falso verde. Esta variável
+      # transforma a ausência do Postgres em erro (ver DECISIONS.md, seção 31).
+      E2E_REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A versão do pnpm sai do campo `packageManager` do package.json da raiz,
+      # então não há um número duplicado aqui para sair de sincronia.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Instalar dependências
+        run: pnpm install --frozen-lockfile
+
+      - name: Aplicar migrations
+        run: pnpm --filter @repo/backend db:migrate:deploy
+
+      - name: Carregar o seed dos 7 cenários
+        run: pnpm --filter @repo/backend db:seed
+
+      - name: Verificar (lint, typecheck, testes unitários e e2e)
+        run: pnpm verify
+
+      - name: Build dos três pacotes
+        run: pnpm build
