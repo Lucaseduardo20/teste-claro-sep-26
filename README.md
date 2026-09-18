@@ -120,6 +120,22 @@ devolve um tipo próprio (`ScoringOutcome`), uma união discriminada em que o ra
 simplesmente não tem onde guardar um risco. O raciocínio completo está na seção 20 do
 [`DECISIONS.md`](./DECISIONS.md).
 
+## Quebras pre-existentes do scaffold, corrigidas
+
+Duas coisas nao funcionavam no repositorio recebido, no Node 22, e nenhuma delas aparecia no
+`pnpm verify` (que roda lint, typecheck e testes — o build do backend nao esta entre eles):
+
+1. **`nest build` e `nest start` morriam antes de ler o projeto.** O
+   `@angular-devkit/schematics` faz `require()` de `ora@9`, que e ESM, dentro de um ciclo de
+   modulos; o Node 22 recusa com `ERR_REQUIRE_CYCLE_MODULE`. Corrigido com um override
+   transitivo fixando `ora` em 5.x (ultima versao CJS), escopado ao `@nestjs/cli` e ao
+   `@angular-devkit/schematics`.
+2. **`pnpm dev:backend` nunca subiu.** O `nest start` nao roda o `tsc-alias`, entao os aliases
+   `@/*` chegavam sem resolver ao `dist` e o processo morria em `ERR_MODULE_NOT_FOUND`. O script
+   `dev` agora roda `tsc --watch`, `tsc-alias --watch` e `node --watch` juntos.
+
+Detalhes e o diagnostico completo na secao 30 do [`DECISIONS.md`](./DECISIONS.md).
+
 ## Uso de IA
 
 Você pode usar IA para fazer o teste. Revise o resultado, entenda as decisões e esteja pronto para explicar o código na conversa final. Registre no README como usou a ferramenta ou diga que não usou. Nenhuma das duas escolhas reduz a nota; o que reprova está na seção **Uso de IA** de [`TESTE.md`](./TESTE.md#uso-de-ia).

@@ -1141,3 +1141,345 @@ O registro específico desta tarefa é sobre **o que a verificação empírica m
 - A tensão em `ScoringResult.risk` (seção 20) foi identificada lendo o contracts, não presumida:
   é o tipo da spec que não expressa o estado que a própria spec descreve. Está registrada aqui,
   como o TESTE.md pede, em vez de contornada em silêncio.
+
+---
+
+## Tarefa 04 — Endpoints e orquestração
+
+Aqui as camadas anteriores se encontram. O `POST /cancellations` chama o Agente de Scoring sob
+deadline (Tarefa 03), deriva o booleano de alto valor a partir dos preços do banco, entrega os
+dois para a regra pura (Tarefa 02) e persiste o resultado.
+
+| Camada                     | Arquivo                                                      |
+| -------------------------- | ------------------------------------------------------------ |
+| Controller (fino)          | `cancellations.controller.ts`, `subscriptions.controller.ts` |
+| Use case (orquestração)    | `create-cancellation.use-case.ts`                            |
+| Regra de alto valor        | `plans/high-value.ts` (fórmula) + `high-value.service.ts`    |
+| Portas de dados            | `*.repository.ts` (interface + token)                        |
+| Adapters Prisma            | `prisma-*.repository.ts`                                     |
+| Tradução banco → contracts | `persistence/domain-mapper.ts`                               |
+
+### 23. Controller fino, use case robusto
+
+O controller tem três linhas de corpo. Não é minimalismo estético — é que **tudo que ele
+poderia fazer já tem um lugar melhor**:
+
+- validar → declarativo no DTO, aplicado pelo `ValidationPipe` global;
+- decidir → `decide()`, da Tarefa 02;
+- orquestrar → o use case;
+- traduzir erro em status → o `AllExceptionsFilter`.
+
+O que sobra é a forma da resposta (`{ cancellation }`), que é de fato assunto do controller.
+
+**O teste é a prova de que a separação é real.** `create-cancellation.use-case.spec.ts` sobe o
+use case com dublês dos dois repositórios, do `ScoringService` e do `HighValueService` — **sem
+servidor HTTP, sem Postgres, sem Prisma**. Se a orquestração estivesse no controller, cada um
+desses 10 testes precisaria de `supertest` e de um banco, e eles simplesmente não existiriam
+nessa quantidade.
+
+O use case também não lança `NotFoundException` do Nest: lança `SubscriptionNotFoundError`, um
+erro de domínio. Quem traduz para 404 é o filtro, na borda. Assim o mesmo use case serve um
+controller REST hoje e um consumidor de fila amanhã, sem que "não encontrei" vire "404" no
+lugar errado.
+
+### 24. A ordem do fluxo, e por que persistir "nu" antes de decidir
+
+```
+findContext  →  createPending  →  score  →  isHighValue  →  applyDecision
+   (404?)        (grava nu)      (deadline)   (query)       (transação)
+```
+
+Essa ordem é asserida literalmente num teste (`expect(log.calls).toEqual([...])`), porque ela é
+uma decisão, não um acaso.
+
+**Por que gravar antes de decidir.** O pedido de cancelamento é um **fato do domínio**: o
+assinante clicou, e isso aconteceu. Se eu só gravasse no fim, todo caminho que falhasse depois
+deste ponto — scoring travado, processo reiniciado, banco caindo no meio — sumiria sem deixar
+rastro. E são justamente esses os casos que alguém vai querer investigar depois.
+
+Isso só é possível porque o schema da Tarefa 01 **admite** esse estado: `risk`, `band`,
+`outcome_type` e `human_reason` são nullable e sem default (seção 1.2). Um cancelamento sem
+outcome não é uma linha corrompida — é "o assinante pediu, o sistema ainda não decidiu". Foi
+para isso que os nullables existem, e é aqui que a decisão de modelagem se paga.
+
+**Por que a consulta de alto valor vem depois do scoring, e não antes.** Porque no timeout ela
+é irrelevante: a regra é conservadora independentemente do valor da assinatura. Consultar antes
+seria uma ida ao banco jogada fora em todo caso de timeout. Tem teste para isso — "nem consulta
+a regra de alto valor" verifica que o método nem é chamado.
+
+### 25. Por que a gravação final é transacional
+
+`applyDecision` faz duas escritas: o `UPDATE` da decisão no cancelamento e, quando o caminho é
+`AUTOMATIC_OFFER`, o `INSERT` da oferta. As duas rodam dentro de `prisma.$transaction`.
+
+Sem isso existiria uma janela em que o banco poderia ficar com
+`outcome_type = 'AUTOMATIC_OFFER'` e **nenhuma linha em `offers`**. Esse estado:
+
+- não é previsto pela spec (`CancellationOutcome` com `type: AUTOMATIC_OFFER` implica uma
+  oferta);
+- quebraria a tela de resultado, que não teria o que mostrar;
+- e é **invisível** para as constraints do banco — a FK garante que toda oferta tem
+  cancelamento, mas nada garante o contrário.
+
+Ou seja: é exatamente o tipo de inconsistência que o schema não consegue impedir sozinho, e por
+isso a aplicação tem que impedir. Uma transação de duas escritas é barata; um relatório de
+métricas com cancelamentos fantasma não é.
+
+### 26. Onde mora a regra de alto valor, e por que é derivada do banco
+
+A Tarefa 02 recebe `isHighValue` pronto (seção 12). **Esta tarefa é a outra metade**, e ela
+ficou dividida em três pedaços, cada um com uma responsabilidade só:
+
+| Pedaço                               | Responsabilidade               | Sabe de banco? |
+| ------------------------------------ | ------------------------------ | -------------- |
+| `deriveHighValueCut(precos, pct)`    | a **fórmula** da spec          | não            |
+| `PlansRepository.distinctPriceCents` | de **onde vêm os preços**      | sim            |
+| `HighValueService`                   | junta os dois                  | via a porta    |
+| `decide(...)` (Tarefa 02)            | o que **fazer** com o booleano | não            |
+
+A fórmula é a do README do contracts: ordene os `priceCents` **distintos**,
+`k = ceil(HIGH_VALUE_PERCENTILE * n)`, os `k` maiores são de alto valor. A query é literalmente
+`SELECT DISTINCT price_cents FROM plans ORDER BY price_cents`.
+
+**"Só o Premium" é consequência, nunca premissa.** Não existe no código nenhuma comparação com
+`19900`, nem com o nome "Premium". Quatro testes atacam exatamente isso:
+
+- com `[1000, 5000, 7000]` → o corte é `{7000}`, e `19900` nem aparece;
+- com um plano "Ultra" de `49900` entrando no catálogo → o corte vira `{49900}` e **o Premium
+  deixa de ser alto valor**;
+- com `19900` sendo o preço mais **barato** dos três → ele não é alto valor;
+- com preços repetidos → o `n` conta preços **distintos**, não planos (seis planos e três
+  preços dão `k=1`, não `k=2`).
+
+Se o avaliador mudar os preços do seed e revalidar, como a spec avisa que pode, o
+comportamento acompanha.
+
+**Sem cache, de propósito.** `plans` é tabela de dimensão com um punhado de linhas, e a consulta
+roda uma vez por cancelamento. Um cache precisaria ser invalidado quando um plano fosse
+cadastrado ou tivesse o preço alterado — exatamente o cenário que a spec diz que será
+exercitado. O ganho seria imperceptível e o risco de servir um corte velho, real.
+
+### 27. Montagem do `ScoringInput` e o N+1 que não existe
+
+`SubscriptionContext` é, por construção, **o `ScoringInput` da spec menos o `rawReason`** (que
+vem do request, não do banco). Não é coincidência: modelado assim, a montagem do input do
+agente no use case é um objeto literal direto, sem o use case precisar saber quais campos
+existem nem de onde cada um veio.
+
+As duas consultas do módulo são **uma query cada**, com `include`:
+
+```ts
+// GET /subscriptions — um JOIN, não 1 + 2N
+this.prisma.subscription.findMany({
+  include: { subscriber: true, plan: true },
+});
+
+// POST /cancellations — assinante, plano e os dois históricos de evento de uma vez
+this.prisma.subscription.findUnique({
+  where: { id },
+  include: {
+    subscriber: true,
+    plan: true,
+    engagementEvents: { orderBy: { occurredAt: "desc" } },
+    paymentEvents: { orderBy: { date: "desc" } },
+  },
+});
+```
+
+Com as 7 assinaturas do seed a diferença é invisível. Com 7 mil, a versão ingênua faria 14 mil
+round-trips só para montar a tela inicial.
+
+A segunda consulta é **exatamente a que os índices compostos da Tarefa 01 servem**
+(`engagement_events (subscription_id, occurred_at)` e `payment_events (subscription_id, date)`):
+filtro pelo prefixo à esquerda e ordenação entregue pelo índice, sem passo de `Sort`. O
+`GET /cancellations/:id` idem, com `cancellations (subscription_id)`.
+
+### 28. O valor da oferta
+
+A spec define o **tipo** e o **status inicial** da oferta (`DEFAULT_OFFER_TYPE`,
+`INITIAL_OFFER_STATUS`, ambos importados do contracts — nada escrito à mão), mas não diz quanto
+descontar. Escolhi **20% do valor recorrente do plano**, e a justificativa é a métrica da
+própria PoC:
+
+- Um caso de retenção humana custa `HUMAN_RETENTION_COST_CENTS` (R$ 15). No plano Basic
+  (R$ 29), 20% são **R$ 5,80 por ciclo** — a oferta se paga contra o custo de um atendimento
+  logo no primeiro mês. O desconto é mais barato que o humano que ele evita, que é a tese do
+  projeto.
+- 5% não muda a decisão de quem já decidiu cancelar; 50% destruiria a margem de quem talvez
+  ficasse de graça.
+
+Duas notas:
+
+- **`amountCents` é o valor do desconto por ciclo**, não o preço novo. A spec não desambigua o
+  campo; escolhi a leitura em que o número é o benefício, porque é assim que ele aparece na tela
+  ("economize R$ 5,80"). Está documentado no código para não virar adivinhação depois.
+- O `0.2` **coincide numericamente com `HIGH_VALUE_PERCENTILE` por acidente**. São grandezas
+  sem relação (fração de preço vs. percentil de uma distribuição), então a constante é própria
+  (`RETENTION_DISCOUNT_RATE`). Reaproveitar a do contracts aqui seria um acoplamento invisível
+  que só apareceria no dia em que alguém mudasse uma das duas.
+
+### 29. Validação, exception filter e logging
+
+**Validação — `class-validator` com `ValidationPipe` global.** Configurado com `whitelist` (o
+que não está no DTO não chega ao use case) e `forbidNonWhitelisted` (mandar campo desconhecido
+é **erro explícito**, não descarte silencioso — um cliente que envia `risk: 0.99` achando que
+manda no resultado merece um 400, não um sucesso enganoso).
+
+O DTO declara `implements CreateCancellationRequest`. Não é decoração: é o compilador impedindo
+que a validação e a documentação desviem do contrato congelado. Se o contracts ganhar um campo,
+a classe para de compilar.
+
+E o validador de UUID delega para o **`isUUIDv7()` do contracts**, em vez de usar o `@IsUUID()`
+do class-validator — que só conhece as versões 3, 4 e 5 e aceitaria um v4 alegremente. Mesma
+coisa no `ParseUUIDv7Pipe` do parâmetro de rota. Ter duas definições de "UUID válido" no projeto
+é garantia de que uma hora elas discordam.
+
+**Exception filter global — três caminhos:**
+
+| Exceção                            | Resposta     | Por quê                                               |
+| ---------------------------------- | ------------ | ----------------------------------------------------- |
+| Erro de domínio (`*NotFoundError`) | 404          | É aqui que "não encontrei" vira status — e só aqui    |
+| `HttpException`                    | o próprio    | preserva a lista de erros de campo do class-validator |
+| Qualquer outra coisa               | 500 genérico | **stack no log, nunca na resposta**                   |
+
+A última linha é a que importa: vazar stack trace entrega caminho de arquivo, versão de
+dependência e estrutura interna a quem estiver sondando. Tem teste e2e afirmando que o corpo do
+erro não contém `"at "` nem `stack`.
+
+Filtro e pipe entram por `APP_FILTER` / `APP_PIPE` (provider) em vez de `app.useGlobalFilters`,
+porque assim recebem injeção de dependência — o filtro precisa do logger.
+
+**Logging — `nestjs-pino`, substituindo o `AppLoggerMiddleware` do scaffold.** O middleware
+montava a linha de log à mão, com códigos de cor ANSI embutidos na string. Era legível para um
+humano no terminal e inútil para qualquer outra coisa. Com pino, o mesmo evento vira JSON com
+campos:
+
+```json
+{ "event": "scoring.timed_out", "cancellationId": "01a0…", "latencyMs": 3000 }
+```
+
+A diferença prática é poder filtrar por `cancellationId`, agrupar por `event` e **alertar em
+cima de `scoring.timed_out`** — exatamente a distinção que a Tarefa 02 (seção 10) argumentou que
+precisava existir. Uma string colorida não sustenta nenhuma das três.
+
+Três ajustes por ambiente: silencioso em teste (log de 30 requisições esconde a falha que
+interessa), `pino-pretty` em desenvolvimento, JSON puro em produção. `authorization` e `cookie`
+vão **redacted**.
+
+**OpenAPI** em `/docs`, com os três endpoints, os status possíveis e os campos do corpo.
+
+### 30. Duas quebras pré-existentes do scaffold que precisei consertar
+
+Nenhuma das duas tem relação com o código do teste, e nenhuma aparecia no `pnpm verify` —
+porque `verify` roda lint, typecheck e testes, e o **build do backend não está entre eles**.
+Registro porque afetam qualquer pessoa que rode o projeto.
+
+**1. O `@nestjs/cli` não roda no Node 22.** `nest build` e `nest start` morriam _antes de ler o
+projeto_:
+
+```
+Error [ERR_REQUIRE_CYCLE_MODULE]: Cannot require() ES Module .../ora/index.js in a cycle
+  (from .../@angular-devkit/schematics/tasks/package-manager/executor.js)
+```
+
+O `@angular-devkit/schematics` faz `require()` de `ora@9`, que é ESM, dentro de um ciclo de
+módulos — e o Node 22 recusa. Confirmei que é pré-existente por dois caminhos: a versão do `ora`
+no lockfile é idêntica antes e depois das minhas instalações, e o stack trace inteiro está
+dentro do CLI, antes de qualquer arquivo meu ser carregado.
+
+Correção: override transitivo fixando `ora` em 5.x (a última versão CJS), escopado a
+`@nestjs/cli` e `@angular-devkit/schematics`. O `shadcn`, no frontend, usa o seu próprio `ora`
+(8.2.0) e não é afetado.
+
+**2. `nest start` não resolvia os aliases `@/*`.** Com o item 1 corrigido, o dev passou a morrer
+em `ERR_MODULE_NOT_FOUND: .../dist/app.module`. O motivo: quem reescreve os aliases é o
+`tsc-alias`, e ele só rodava no script de `build`. O `nest start` compila e executa direto, sem
+essa etapa — então `pnpm dev:backend` **nunca funcionou** neste scaffold.
+
+Correção: o `dev` agora roda `tsc --watch`, `tsc-alias --watch` e `node --watch` juntos, via
+`concurrently`. Conferido: `pnpm build` passa nos três pacotes e `pnpm dev:backend` responde em
+`localhost:3000`.
+
+**Por que não `tsx` para o dev**, já que ele estava ali para o seed: o esbuild **não emite
+`emitDecoratorMetadata`**, e sem essa metadata a injeção de dependência do Nest quebra em
+runtime. Cheguei a tentar; o erro foi `Nest can't resolve dependencies of the
+CreateCancellationUseCase (..., ?, +, ...)`, com os parâmetros tipados por classe vindo
+`undefined`. É o mesmo motivo pelo qual o `@repo/lint` desliga a regra
+`consistent-type-imports` no backend.
+
+### 31. Estratégia dos testes
+
+**44 testes novos**, em três níveis, e a divisão é deliberada:
+
+| Nível                        | Quantos | O que usa de verdade                    |
+| ---------------------------- | ------- | --------------------------------------- |
+| Fórmula de alto valor (pura) | 15      | nada — função pura                      |
+| Use case (orquestração)      | 10      | nada; dublês dos repositórios e agentes |
+| e2e do fluxo                 | 19      | HTTP, Nest e **Postgres** de verdade    |
+
+No e2e o **único dublê é o Agente de Scoring**, trocado por `overrideProvider` no token
+`SCORING_AGENT` — a prova de que a DI por token da Tarefa 03 serve para o que foi desenhada. Ele
+devolve o risco do cenário **sem latência**: os 200–1500ms do mock fariam a suíte levar dez
+segundos sem provar nada a mais, porque o mecanismo do deadline já tem os testes dele.
+
+**A exceção é o `scenario-timeout`.** Ali o agente devolve uma promessa que **nunca resolve** —
+o mais fiel ao que um agente travado faz — e quem decide é o relógio real, em ~3s. É o único
+teste lento da suíte, e é lento de propósito.
+
+**O e2e é pulado, com aviso visível, quando o Postgres não está de pé.** A razão é que o
+scaffold prometia `pnpm verify` verde num clone limpo, e eu não quero que a minha entrega
+transforme "não tenho Docker agora" em suíte vermelha. Mas pular em silêncio seria pior que
+falhar: por isso o aviso é impresso, e `E2E_REQUIRE_DB=1` transforma a ausência do banco em
+erro — que é o comportamento certo em CI, onde o banco **deve** existir.
+
+O seed foi extraído para `src/prisma/seed-scenarios.ts`, com o script `prisma/seed.ts` virando
+uma casca de três linhas. Motivo: o e2e precisa garantir os dados antes de bater nos endpoints,
+e um seed que só existe como script vira `INSERT` copiado e colado dentro do teste — duas
+fontes da verdade que divergem no primeiro cenário novo.
+
+### 32. Tradução banco → contracts, sem um único `as`
+
+O mapper (`persistence/domain-mapper.ts`) resolve três incompatibilidades:
+
+1. **`Date` → `ISO8601`.** O contracts tipa todo timestamp como string.
+2. **`Decimal` → `number`.** `risk` é `numeric(3,2)` (Tarefa 01, seção 3.5) e chega como
+   `Decimal` do decimal.js.
+3. **Enum do Prisma → enum do contracts.** São tipos diferentes: o do Prisma é uma união de
+   literais de string; o do contracts é um `enum` nominal, e TypeScript **não** deixa atribuir
+   `"MONTHLY"` a `BillingCycle`.
+
+O terceiro é o interessante. A saída óbvia seria `row.cycle as BillingCycle` — e um `as` é
+exatamente o tipo de escape que a rubrica pune, porque desliga a verificação em vez de resolver
+o problema. A solução foi **indexar o enum pela chave**:
+
+```ts
+cycle: BillingCycle[row.cycle];
+```
+
+Como os membros do enum do contracts têm chaves iguais aos valores do Prisma, isso é uma
+indexação normal, checada pelo compilador **nas duas direções**: se o Prisma ganhasse um valor
+que o contracts não tem, o arquivo pararia de compilar. Não há um `as`, um `any` ou um
+`@ts-ignore` em nenhum lugar deste módulo.
+
+Por fim, o `null` do banco vira **ausência de propriedade**, não `undefined` atribuído — o
+`exactOptionalPropertyTypes` do tsconfig distingue os dois, e a spec também: `outcome` ausente é
+"ainda não decidido".
+
+### 33. Uso de IA (Tarefa 04)
+
+Feita com assistência de IA (Claude Code), revisada por mim, nos mesmos termos das anteriores.
+
+O que vale registrar desta tarefa:
+
+- **As duas quebras do scaffold (seção 30) foram diagnosticadas, não contornadas.** A tentação
+  era trocar o build por algo que funcionasse e seguir. Em vez disso: identifiquei a causa
+  (`require(ESM)` em ciclo), provei que era pré-existente comparando o lockfile antes e depois,
+  e corrigi na raiz com um override escopado — mantendo os scripts do scaffold intactos.
+- **O `tsx` no dev foi testado e rejeitado com motivo**, não por preferência: o erro de DI em
+  runtime mostrou que o esbuild não emite `emitDecoratorMetadata`.
+- **Verificação contra o banco real antes de escrever o e2e.** Subi a API e rodei os 7 cenários
+  por `curl`, conferindo os outcomes um a um, mais os quatro caminhos de erro. Os testes vieram
+  depois, para travar o que eu já tinha visto funcionar.
+- **A separação em três níveis de teste (seção 31) foi decisão consciente** sobre onde cada
+  garantia custa menos: fórmula pura em milissegundos, orquestração sem I/O, e só o fluxo
+  completo pagando o preço do banco.
