@@ -1,54 +1,76 @@
+import Link from "next/link";
+
+import { PageHeader, PageShell } from "@/components/page-shell";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { listSubscriptions } from "@/lib/api";
+import { formatCents } from "@/lib/format";
 
-const pronto = [
-  "Next.js 16 (App Router) + React 19 + TypeScript estrito",
-  "Tailwind CSS 4, shadcn/ui (estilo base-maia) e `@/components/ui/button`",
-  "Contratos de domínio em `@repo/contracts` (pacote do monorepo, já compilado)",
-  "Abas e rotas livres: a estrutura de telas do fluxo é decisão sua",
-];
+/**
+ * Tela 1 — as assinaturas do assinante.
+ *
+ * Server Component: os dados vêm de `GET /subscriptions` direto no servidor, então o HTML
+ * já chega pronto e a API nunca é exposta ao browser. Não há estado nem interação nesta
+ * tela — só leitura e um link por assinatura —, que é exatamente o caso em que um
+ * componente cliente não acrescentaria nada além de JavaScript no bundle.
+ */
+export default async function SubscriptionsPage() {
+  const { subscriptions } = await listSubscriptions();
 
-export default function Home() {
   return (
-    <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-6 px-6 py-16">
-      <header className="space-y-2">
-        <p className="text-sm font-medium text-muted-foreground">
-          Teste técnico - Dev Sr Fullstack
-        </p>
-        <h1 className="font-heading text-3xl font-semibold tracking-tight text-balance">
-          Cancelamento com Retenção Inteligente
-        </h1>
-      </header>
+    <PageShell>
+      <PageHeader
+        eyebrow="Minha conta"
+        title="Suas assinaturas"
+        description="Escolha a assinatura que você quer cancelar."
+      />
 
-      <p className="text-muted-foreground text-pretty">
-        Este é o scaffold do frontend. Ele sobe, builda e passa no lint. O fluxo de cancelamento
-        (telas de início, motivo, processamento e resultado) é o que você vai construir. A
-        especificação completa está em <code className="font-mono text-foreground">TESTE.md</code> e
-        os contratos em <code className="font-mono text-foreground">packages/contracts</code>, na
-        raiz do repositório.
-      </p>
+      {subscriptions.length === 0 ? (
+        <p className="text-muted-foreground">Você não tem assinaturas ativas no momento.</p>
+      ) : (
+        <ul className="flex flex-col gap-4">
+          {subscriptions.map(({ subscription, subscriber, plan }) => (
+            <li key={subscription.id}>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Plano {plan.name}</CardTitle>
+                  <p className="text-muted-foreground text-sm">Assinante: {subscriber.name}</p>
+                </CardHeader>
 
-      <section aria-labelledby="pronto" className="space-y-3">
-        <h2 id="pronto" className="text-sm font-semibold uppercase tracking-wide">
-          Já pronto
-        </h2>
-        <ul className="space-y-2">
-          {pronto.map((item) => (
-            <li key={item} className="text-muted-foreground flex gap-2 text-sm">
-              <span aria-hidden="true" className="text-foreground">
-                •
-              </span>
-              {item}
+                <CardContent>
+                  <p className="text-2xl font-semibold tracking-tight">
+                    {formatCents(plan.priceCents)}
+                    <span className="text-muted-foreground ml-1 text-sm font-normal">/mês</span>
+                  </p>
+                  <ul className="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                    {plan.benefits.map((benefit) => (
+                      <li key={benefit}>{benefit}</li>
+                    ))}
+                  </ul>
+                </CardContent>
+
+                <CardFooter>
+                  {/* `String(id)` porque o id do contracts e um tipo *branded* (UUIDv7) e o
+                      typedRoutes do Next so infere a rota a partir de `string` puro. A
+                      interpolacao fica inline: extrair para uma const alargaria o tipo para
+                      `string` e a rota deixaria de ser verificada. */}
+                  <Button
+                    variant="outline"
+                    render={
+                      <Link href={`/subscriptions/${String(subscription.id)}/cancel`}>
+                        <span aria-hidden="true">Cancelar assinatura</span>
+                        {/* Numa lista de varios botoes iguais, o leitor de tela precisa
+                            distinguir de qual assinatura e cada um. */}
+                        <span className="sr-only">Cancelar assinatura do plano {plan.name}</span>
+                      </Link>
+                    }
+                  />
+                </CardFooter>
+              </Card>
             </li>
           ))}
         </ul>
-      </section>
-
-      <div className="flex flex-wrap gap-3">
-        <Button render={<a href="http://localhost:3000/health" />}>Ver /health da API</Button>
-        <Button variant="outline" render={<a href="https://nextjs.org/docs" />}>
-          Documentação do Next.js
-        </Button>
-      </div>
-    </main>
+      )}
+    </PageShell>
   );
 }
