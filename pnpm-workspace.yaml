@@ -18,3 +18,10 @@ allowBuilds:
 # mantém `npm audit` limpo para quem for avaliar.
 overrides:
   multer: ^2.3.0
+  # O @nestjs/cli quebra no Node 22 (`nest build` e `nest start` morrem antes de ler o
+  # projeto): o @angular-devkit/schematics faz require() de ora@9, que e ESM, dentro de um
+  # ciclo de modulos — e o Node 22 recusa (ERR_REQUIRE_CYCLE_MODULE). Fixar o ora em 5.x
+  # (a ultima versao CJS) nessa dependencia transitiva desfaz o ciclo. Nenhum codigo do
+  # projeto importa ora; o shadcn, no frontend, usa o seu proprio (8.2.0) e nao e afetado.
+  "@angular-devkit/schematics>ora": ^5.4.1
+  "@nestjs/cli>ora": ^5.4.1
