@@ -1,7 +1,10 @@
-# Infraestrutura disponível no scaffold: Postgres.
+# Sobe a PoC inteira: Postgres, API e frontend.
 #
-# `docker compose up -d db` (ou `pnpm db:up`) inicia apenas o banco. A entrega
-# deve incluir API e frontend, para que `docker compose up` inicie o fluxo completo.
+#   docker compose up          -> tudo (o backend aplica migrations e carrega o seed)
+#   docker compose up -d db    -> so o Postgres, para desenvolver com `pnpm dev`
+#
+# Escrito para Compose V2 (`docker compose`, com espaço), que é o que acompanha o
+# Docker Engine atual — daí a ausência da chave `version:`, removida da spec.
 
 services:
   db:
@@ -25,6 +28,66 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  backend:
+    build:
+      # O contexto é a raiz do monorepo: o backend depende de `@repo/contracts`
+      # por workspace, e buildar só `apps/backend` deixaria a dependência de fora.
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    container_name: smart-retention-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        # `service_healthy` e não `service_started`: o Postgres aceita conexão
+        # bem depois de o container subir, e o entrypoint roda migration na largada.
+        condition: service_healthy
+    environment:
+      # Host `db`, não `localhost`: dentro da rede do compose, o nome do serviço
+      # é o hostname. Esta é a diferença que mais quebra "funciona na minha máquina".
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-smart_retention}
+      PORT: "3000"
+      NODE_ENV: production
+    ports:
+      - "${API_PORT:-3000}:3000"
+    healthcheck:
+      # Usa o `/health` que o scaffold já expunha. `node -e` porque a imagem slim
+      # não traz curl nem wget, e instalar um só para o healthcheck seria peso morto.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # O entrypoint roda migration + seed antes de servir; o start_period evita
+      # que o container seja marcado como não saudável durante esse trabalho.
+      start_period: 60s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    container_name: smart-retention-web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # `API_URL` é o endereço que o **servidor do Next** usa, dentro da rede do
+      # compose. `NEXT_PUBLIC_API_URL` é o que o browser usaria — e são diferentes
+      # de propósito. Todo o fetch deste app é server-side, então quem manda é o
+      # primeiro (ver DECISIONS.md, seção 34).
+      API_URL: http://backend:3000
+      NEXT_PUBLIC_API_URL: http://localhost:${API_PORT:-3000}
+      PORT: "3001"
+      HOSTNAME: 0.0.0.0
+      NODE_ENV: production
+    ports:
+      - "${WEB_PORT:-3001}:3001"
 
 volumes:
   db-data:

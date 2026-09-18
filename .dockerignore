@@ -1,0 +1,28 @@
+# O contexto do build e a raiz do monorepo. Tudo que o build refaz, ou que e da
+# maquina de quem desenvolve, fica de fora — senao o contexto vai de alguns MB
+# para centenas e o build fica lento sem ganho nenhum.
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/coverage
+**/*.tsbuildinfo
+
+.git
+.github
+__MACOSX
+
+# Ambiente: o compose injeta as variaveis, o .env local nao entra na imagem.
+**/.env
+**/.env.local
+
+# Ferramentas locais de agente
+.claude
+.cursor
+.opencode
+.agents
+skills-lock.json
+
+# Documentacao: nao muda o build, e invalidaria o cache a cada edicao.
+*.md
+!packages/contracts/README.md
