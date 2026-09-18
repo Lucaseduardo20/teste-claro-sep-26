@@ -6,6 +6,8 @@ packages:
 # do postinstall para funcionar, pois incluem binários nativos e git hooks.
 allowBuilds:
   "@prisma/engines": true
+  # Telemetria do pino: o postinstall dele so faz analytics, nao e necessario.
+  "@scarf/scarf": false
   esbuild: true
   lefthook: true
   prisma: true
